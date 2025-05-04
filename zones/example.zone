@@ -1,0 +1,2 @@
+example.com 3600 A 93.184.216.34
+www.example.com 3600 CNAME example.com
