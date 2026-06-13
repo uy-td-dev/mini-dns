@@ -1,0 +1,24 @@
+services:
+  mini-dns:
+    build: .
+    image: mini-dns:latest
+    container_name: mini-dns
+    restart: unless-stopped
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      # - "853:853/tcp"     # DNS-over-TLS  (set MINI_DNS_DOT_ADDR)
+      # - "8443:8443/tcp"   # DNS-over-HTTPS (set MINI_DNS_DOH_ADDR)
+      # - "9090:9090/tcp"   # Prometheus metrics (set MINI_DNS_METRICS_ADDR)
+    environment:
+      MINI_DNS_ADDR: "0.0.0.0:53"
+      MINI_DNS_ZONE: "/app/zones/example.zone"
+      MINI_DNS_UPSTREAM: "1.1.1.1:53"
+      MINI_DNS_RATE_LIMIT: "50"
+      # MINI_DNS_DOT_ADDR: "0.0.0.0:853"
+      # MINI_DNS_DOH_ADDR: "0.0.0.0:8443"
+      # MINI_DNS_METRICS_ADDR: "0.0.0.0:9090"
+      RUST_LOG: "mini_dns=info"
+    # Mount your own zone file (overrides the baked-in one):
+    volumes:
+      - ./zones:/app/zones:ro
