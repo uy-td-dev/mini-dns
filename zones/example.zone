@@ -1,2 +1,8 @@
+example.com 3600 SOA ns1.example.com. admin.example.com. 2024010101 7200 3600 1209600 3600
+example.com 3600 NS ns1.example.com.
 example.com 3600 A 93.184.216.34
+example.com 3600 AAAA 2606:2800:220:1:248:1893:25c8:1946
+example.com 3600 MX 10 mail.example.com.
+example.com 3600 TXT "v=spf1 -all"
 www.example.com 3600 CNAME example.com
+*.example.com 3600 A 192.0.2.9

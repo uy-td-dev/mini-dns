@@ -1,59 +1,184 @@
 //! `encoder` module provides functionality for encoding DNS packets into byte format.
 use crate::dns::packet::DnsPacket;
 use crate::dns::record::DnsRecord;
+use std::collections::HashMap;
 use std::vec::Vec;
 
-/// `DnsPacketEncoder` is responsible for converting a `DnsPacket` into a byte vector.
-pub struct DnsPacketEncoder;
+/// `DnsPacketEncoder` converts a `DnsPacket` into a byte vector.
+///
+/// It applies RFC 1035 name compression: the first time a (sub)domain is
+/// written its offset is remembered, and later occurrences of the same suffix
+/// are emitted as a 2-byte pointer instead of the full labels.
+pub struct DnsPacketEncoder {
+    buf: Vec<u8>,
+    /// Maps a domain suffix (e.g. "www.example.com") to the offset where it was
+    /// first written, so it can be referenced via a compression pointer.
+    name_offsets: HashMap<String, u16>,
+}
 
 impl DnsPacketEncoder {
     /// Encodes a `DnsPacket` into a byte vector.
     pub fn to_bytes(packet: &DnsPacket) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&packet.header.id.to_be_bytes());
-        buf.extend_from_slice(&packet.header.flags.to_be_bytes());
-        buf.extend_from_slice(&(packet.questions.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&(packet.answers.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&(packet.authorities.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&(packet.additionals.len() as u16).to_be_bytes());
+        let mut encoder = DnsPacketEncoder {
+            buf: Vec::new(),
+            name_offsets: HashMap::new(),
+        };
+        encoder.encode(packet);
+        encoder.buf
+    }
+
+    fn encode(&mut self, packet: &DnsPacket) {
+        self.buf.extend_from_slice(&packet.header.id.to_be_bytes());
+        self.buf.extend_from_slice(&packet.header.flags.to_be_bytes());
+        self.buf
+            .extend_from_slice(&(packet.questions.len() as u16).to_be_bytes());
+        self.buf
+            .extend_from_slice(&(packet.answers.len() as u16).to_be_bytes());
+        self.buf
+            .extend_from_slice(&(packet.authorities.len() as u16).to_be_bytes());
+        self.buf
+            .extend_from_slice(&(packet.additionals.len() as u16).to_be_bytes());
 
         for question in &packet.questions {
-            Self::encode_qname(&mut buf, &question.qname);
-            buf.extend_from_slice(&question.qtype.to_be_bytes());
-            buf.extend_from_slice(&question.qclass.to_be_bytes());
+            self.encode_qname(&question.qname);
+            self.buf.extend_from_slice(&question.qtype.to_be_bytes());
+            self.buf.extend_from_slice(&question.qclass.to_be_bytes());
         }
 
         for answer in &packet.answers {
-            match answer {
-                DnsRecord::A { domain, addr, ttl } => {
-                    Self::encode_qname(&mut buf, domain);
-                    buf.extend_from_slice(&1u16.to_be_bytes()); // Type A
-                    buf.extend_from_slice(&1u16.to_be_bytes()); // Class IN
-                    buf.extend_from_slice(&ttl.to_be_bytes());
-                    buf.extend_from_slice(&4u16.to_be_bytes()); // Data length
-                    buf.extend_from_slice(&addr.octets());
-                }
-                DnsRecord::CNAME { domain, alias, ttl } => {
-                    Self::encode_qname(&mut buf, domain);
-                    buf.extend_from_slice(&5u16.to_be_bytes()); // Type CNAME
-                    buf.extend_from_slice(&1u16.to_be_bytes()); // Class IN
-                    buf.extend_from_slice(&ttl.to_be_bytes());
-                    let mut alias_buf = Vec::new();
-                    Self::encode_qname(&mut alias_buf, alias);
-                    buf.extend_from_slice(&(alias_buf.len() as u16).to_be_bytes());
-                    buf.extend_from_slice(&alias_buf);
-                }
-            }
+            self.encode_record(answer);
         }
-        buf
     }
 
-    /// Encodes a domain name into the buffer in the label format.
-    fn encode_qname(buf: &mut Vec<u8>, qname: &str) {
-        for label in qname.split('.') {
-            buf.push(label.len() as u8);
-            buf.extend_from_slice(label.as_bytes());
+    /// Encodes a single resource record into the buffer.
+    fn encode_record(&mut self, record: &DnsRecord) {
+        match record {
+            DnsRecord::A { domain, addr, ttl } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_A, *ttl);
+                self.buf.extend_from_slice(&4u16.to_be_bytes()); // Data length
+                self.buf.extend_from_slice(&addr.octets());
+            }
+            DnsRecord::AAAA { domain, addr, ttl } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_AAAA, *ttl);
+                self.buf.extend_from_slice(&16u16.to_be_bytes()); // Data length
+                self.buf.extend_from_slice(&addr.octets());
+            }
+            DnsRecord::CNAME { domain, alias, ttl } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_CNAME, *ttl);
+                self.encode_rdata(|enc| enc.encode_qname(alias));
+            }
+            DnsRecord::MX {
+                domain,
+                preference,
+                exchange,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_MX, *ttl);
+                self.encode_rdata(|enc| {
+                    enc.buf.extend_from_slice(&preference.to_be_bytes());
+                    enc.encode_qname(exchange);
+                });
+            }
+            DnsRecord::TXT { domain, text, ttl } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_TXT, *ttl);
+                self.encode_rdata(|enc| enc.encode_character_strings(text));
+            }
+            DnsRecord::NS {
+                domain,
+                nameserver,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_NS, *ttl);
+                self.encode_rdata(|enc| enc.encode_qname(nameserver));
+            }
+            DnsRecord::SOA {
+                domain,
+                mname,
+                rname,
+                serial,
+                refresh,
+                retry,
+                expire,
+                minimum,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_SOA, *ttl);
+                self.encode_rdata(|enc| {
+                    enc.encode_qname(mname);
+                    enc.encode_qname(rname);
+                    enc.buf.extend_from_slice(&serial.to_be_bytes());
+                    enc.buf.extend_from_slice(&refresh.to_be_bytes());
+                    enc.buf.extend_from_slice(&retry.to_be_bytes());
+                    enc.buf.extend_from_slice(&expire.to_be_bytes());
+                    enc.buf.extend_from_slice(&minimum.to_be_bytes());
+                });
+            }
         }
-        buf.push(0);
+    }
+
+    /// Writes the common record header (name, type, class IN, TTL).
+    fn encode_record_header(&mut self, domain: &str, rtype: u16, ttl: u32) {
+        self.encode_qname(domain);
+        self.buf.extend_from_slice(&rtype.to_be_bytes());
+        self.buf.extend_from_slice(&1u16.to_be_bytes()); // Class IN
+        self.buf.extend_from_slice(&ttl.to_be_bytes());
+    }
+
+    /// Writes variable-length rdata produced by `write_body`, backfilling the
+    /// 2-byte rdlength once the actual length is known (necessary because name
+    /// compression makes the encoded size depend on prior content).
+    fn encode_rdata(&mut self, write_body: impl FnOnce(&mut Self)) {
+        let len_pos = self.buf.len();
+        self.buf.extend_from_slice(&0u16.to_be_bytes());
+        let rdata_start = self.buf.len();
+        write_body(self);
+        let rdlength = (self.buf.len() - rdata_start) as u16;
+        self.buf[len_pos..len_pos + 2].copy_from_slice(&rdlength.to_be_bytes());
+    }
+
+    /// Encodes text as one or more DNS character-strings (each a length byte
+    /// followed by up to 255 bytes), splitting longer text across strings.
+    fn encode_character_strings(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        if bytes.is_empty() {
+            self.buf.push(0);
+            return;
+        }
+        for chunk in bytes.chunks(255) {
+            self.buf.push(chunk.len() as u8);
+            self.buf.extend_from_slice(chunk);
+        }
+    }
+
+    /// Encodes a domain name into the buffer in label format, using compression
+    /// pointers for any suffix that has already been written.
+    fn encode_qname(&mut self, qname: &str) {
+        if qname.is_empty() {
+            self.buf.push(0);
+            return;
+        }
+
+        let labels: Vec<&str> = qname.split('.').collect();
+        for i in 0..labels.len() {
+            let suffix = labels[i..].join(".");
+            if let Some(&offset) = self.name_offsets.get(&suffix) {
+                let pointer = 0xC000 | offset;
+                self.buf.extend_from_slice(&pointer.to_be_bytes());
+                return;
+            }
+
+            // Only positions addressable by a 14-bit pointer can be referenced.
+            if self.buf.len() <= 0x3FFF {
+                self.name_offsets.insert(suffix, self.buf.len() as u16);
+            }
+
+            let label = labels[i];
+            // Labels are limited to 63 bytes; the two high bits are reserved for
+            // pointers, so a longer label cannot be represented.
+            let label_len = label.len().min(63);
+            self.buf.push(label_len as u8);
+            self.buf.extend_from_slice(&label.as_bytes()[..label_len]);
+        }
+        self.buf.push(0);
     }
 }

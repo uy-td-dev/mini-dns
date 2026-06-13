@@ -1,0 +1,88 @@
+//! A simple per-client fixed-window rate limiter.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+struct Window {
+    started_at: Instant,
+    count: u32,
+}
+
+/// Limits each client IP to at most `max_per_window` queries per `window`.
+///
+/// A `max_per_window` of zero disables limiting (all queries are allowed). This
+/// guards against floods and DNS amplification abuse.
+pub struct RateLimiter {
+    max_per_window: u32,
+    window: Duration,
+    clients: Mutex<HashMap<IpAddr, Window>>,
+}
+
+impl RateLimiter {
+    /// Creates a limiter allowing `max_per_window` queries per `window`.
+    /// Pass `max_per_window = 0` to disable limiting entirely.
+    pub fn new(max_per_window: u32, window: Duration) -> Self {
+        RateLimiter {
+            max_per_window,
+            window,
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A disabled limiter that allows every query.
+    pub fn disabled() -> Self {
+        Self::new(0, Duration::from_secs(1))
+    }
+
+    /// Records a query from `ip` and returns `true` if it is within the limit.
+    pub fn allow(&self, ip: IpAddr) -> bool {
+        if self.max_per_window == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let mut clients = self.clients.lock().unwrap();
+        let window = clients.entry(ip).or_insert(Window {
+            started_at: now,
+            count: 0,
+        });
+
+        if now.duration_since(window.started_at) >= self.window {
+            window.started_at = now;
+            window.count = 0;
+        }
+        window.count += 1;
+        window.count <= self.max_per_window
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, last))
+    }
+
+    #[test]
+    fn disabled_allows_everything() {
+        let limiter = RateLimiter::disabled();
+        for _ in 0..1000 {
+            assert!(limiter.allow(ip(1)));
+        }
+    }
+
+    #[test]
+    fn enforces_limit_per_client() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        assert!(limiter.allow(ip(1)));
+        assert!(limiter.allow(ip(1)));
+        assert!(limiter.allow(ip(1)));
+        assert!(!limiter.allow(ip(1))); // 4th exceeds the limit
+
+        // A different client has its own budget.
+        assert!(limiter.allow(ip(2)));
+    }
+}
