@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mini-dns — Documentation</title>
+  <meta name="description" content="A lightweight DNS server in Rust — usage guide." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <h1>mini-dns</h1>
+      <p class="tagline">A lightweight DNS server in Rust — authoritative zones, recursive forwarding,
+        TTL caching, DoT/DoH, Prometheus metrics, and per-client rate limiting.</p>
+      <p class="links">
+        <a class="btn" href="#quickstart">Quick start</a>
+        <a class="btn ghost" href="https://github.com/uy-td-dev/mini-dns">GitHub →</a>
+      </p>
+    </div>
+  </header>
+
+  <div class="layout wrap">
+    <nav class="toc">
+      <strong>Contents</strong>
+      <ul>
+        <li><a href="#features">Features</a></li>
+        <li><a href="#install">Install &amp; build</a></li>
+        <li><a href="#quickstart">Quick start</a></li>
+        <li><a href="#zone">Zone file</a></li>
+        <li><a href="#config">Configuration</a></li>
+        <li><a href="#recursion">Recursion &amp; caching</a></li>
+        <li><a href="#reload">Reloading the zone</a></li>
+        <li><a href="#encrypted">DoT / DoH</a></li>
+        <li><a href="#metrics">Metrics</a></li>
+        <li><a href="#query">Querying</a></li>
+      </ul>
+    </nav>
+
+    <main class="content">
+      <section id="features">
+        <h2>Features</h2>
+        <ul>
+          <li>Record types: <code>A</code>, <code>AAAA</code>, <code>CNAME</code>, <code>MX</code>,
+            <code>TXT</code>, <code>NS</code>, <code>SOA</code>, <code>SRV</code>, <code>PTR</code>, <code>CAA</code></li>
+          <li>Wildcard records (<code>*.example.com</code>) and CNAME chaining</li>
+          <li>Case-insensitive lookups; correct <code>AA</code> / <code>NXDOMAIN</code> / <code>NODATA</code> handling</li>
+          <li><strong>EDNS(0)</strong>, UDP truncation (<code>TC</code>) with TCP fallback, name compression</li>
+          <li><strong>Recursive forwarding</strong> with a TTL cache (positive and negative/NXDOMAIN caching)</li>
+          <li><strong>Encrypted transports</strong>: DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH, HTTP/1.1 &amp; HTTP/2)</li>
+          <li><strong>Prometheus metrics</strong>, per-client rate limiting, and hot zone reload on <code>SIGHUP</code></li>
+        </ul>
+      </section>
+
+      <section id="install">
+        <h2>Install &amp; build</h2>
+        <p>Requires a recent stable Rust toolchain. Build in release mode:</p>
+        <pre><code>git clone https://github.com/uy-td-dev/mini-dns.git
+cd mini-dns
+cargo build --release</code></pre>
+        <p>The binary is produced at <code>./target/release/mini-dns</code>. Prebuilt binaries for Linux,
+          macOS, and Windows are also attached to each
+          <a href="https://github.com/uy-td-dev/mini-dns/releases">GitHub Release</a>.</p>
+      </section>
+
+      <section id="quickstart">
+        <h2>Quick start</h2>
+        <p>Run with defaults — listens on <code>127.0.0.1:8888</code> (UDP and TCP):</p>
+        <pre><code>./target/release/mini-dns</code></pre>
+        <p>Query it with <code>dig</code>:</p>
+        <pre><code>dig @127.0.0.1 -p 8888 example.com A</code></pre>
+      </section>
+
+      <section id="zone">
+        <h2>Zone file</h2>
+        <p>Records are loaded from a zone file (defaults to <code>zones/example.zone</code>, override with
+          <code>--zone</code> / <code>MINI_DNS_ZONE</code>). Each line is one record:</p>
+        <pre><code>&lt;domain&gt; &lt;ttl&gt; &lt;type&gt; &lt;data&gt;</code></pre>
+        <p>Example:</p>
+        <pre><code>example.com.     3600 SOA   ns1.example.com. admin.example.com. 1 7200 3600 1209600 3600
+example.com.     3600 NS    ns1.example.com.
+example.com.     3600 A     192.0.2.1
+example.com.     3600 AAAA  2001:db8::1
+www.example.com. 3600 CNAME example.com.
+example.com.     3600 MX    10 mail.example.com.
+example.com.     3600 TXT   "v=spf1 -all"
+*.example.com.   3600 A     192.0.2.9</code></pre>
+        <p>Blank lines and lines starting with <code>;</code> are ignored. A malformed line is logged with its
+          line number and skipped, so one bad entry won't stop the rest of the zone from loading.</p>
+      </section>
+
+      <section id="config">
+        <h2>Configuration</h2>
+        <p>Settings come from CLI flags or environment variables — <strong>flags take precedence</strong>.</p>
+        <div class="table-scroll">
+        <table>
+          <thead><tr><th>Flag</th><th>Env var</th><th>Description</th><th>Default</th></tr></thead>
+          <tbody>
+            <tr><td><code>-z</code>, <code>--zone</code></td><td><code>MINI_DNS_ZONE</code></td><td>Path to the zone file</td><td><code>zones/example.zone</code></td></tr>
+            <tr><td><code>-a</code>, <code>--addr</code></td><td><code>MINI_DNS_ADDR</code></td><td>Address to bind (UDP + TCP)</td><td><code>127.0.0.1:8888</code></td></tr>
+            <tr><td><code>-u</code>, <code>--upstream</code></td><td><code>MINI_DNS_UPSTREAM</code></td><td>Upstream resolver for recursion (<code>host:port</code>)</td><td><code>8.8.8.8:53</code></td></tr>
+            <tr><td><code>--no-recurse</code></td><td>—</td><td>Disable forwarding; serve only the local zone</td><td>off</td></tr>
+            <tr><td><code>--rate-limit</code></td><td><code>MINI_DNS_RATE_LIMIT</code></td><td>Max queries/client/sec (<code>0</code> = unlimited)</td><td><code>0</code></td></tr>
+            <tr><td><code>--cache-size</code></td><td>—</td><td>Max cached forwarded answers</td><td><code>1024</code></td></tr>
+            <tr><td><code>--dot-addr</code></td><td><code>MINI_DNS_DOT_ADDR</code></td><td>Enable DNS-over-TLS on this address</td><td>disabled</td></tr>
+            <tr><td><code>--doh-addr</code></td><td><code>MINI_DNS_DOH_ADDR</code></td><td>Enable DNS-over-HTTPS on this address</td><td>disabled</td></tr>
+            <tr><td><code>--tls-cert</code></td><td><code>MINI_DNS_TLS_CERT</code></td><td>TLS certificate (PEM)</td><td>self-signed</td></tr>
+            <tr><td><code>--tls-key</code></td><td><code>MINI_DNS_TLS_KEY</code></td><td>TLS private key (PEM)</td><td>self-signed</td></tr>
+            <tr><td><code>--metrics-addr</code></td><td><code>MINI_DNS_METRICS_ADDR</code></td><td>Expose Prometheus <code>/metrics</code> (plain HTTP)</td><td>disabled</td></tr>
+            <tr><td><code>-v</code>, <code>--verbose</code></td><td>—</td><td>Increase log verbosity (<code>-v</code>, <code>-vv</code>)</td><td>INFO level</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p>Log level can also be set via the <code>RUST_LOG</code> environment variable. Example — serve a custom
+          zone on port 5353, forward to Cloudflare, and rate-limit to 50 q/s per client:</p>
+        <pre><code>./target/release/mini-dns --zone /etc/mini-dns/db.zone --addr 0.0.0.0:5353 \
+    --upstream 1.1.1.1:53 --rate-limit 50 -v</code></pre>
+      </section>
+
+      <section id="recursion">
+        <h2>Recursion &amp; caching</h2>
+        <p>By default, names not found in the zone are forwarded to the upstream resolver and answers are cached
+          for their TTL. Use <code>--no-recurse</code> to run as a pure authoritative server (returning
+          <code>NXDOMAIN</code> for unknown names).</p>
+      </section>
+
+      <section id="reload">
+        <h2>Reloading the zone</h2>
+        <p>Send <code>SIGHUP</code> to reload the zone file in place, without dropping in-flight queries or restarting:</p>
+        <pre><code>kill -HUP $(pgrep mini-dns)</code></pre>
+      </section>
+
+      <section id="encrypted">
+        <h2>Encrypted transports (DoT / DoH)</h2>
+        <p>Enable DNS-over-TLS and/or DNS-over-HTTPS by giving them an address. If no certificate is provided, a
+          self-signed certificate for <code>localhost</code> is generated at startup (local testing only):</p>
+        <pre><code>./target/release/mini-dns --dot-addr 127.0.0.1:8853 --doh-addr 127.0.0.1:8443</code></pre>
+        <p>DoH exposes <code>/dns-query</code> (RFC 8484) over HTTP/1.1 and HTTP/2, accepting <code>POST</code> with
+          an <code>application/dns-message</code> body or <code>GET ?dns=&lt;base64url&gt;</code>.</p>
+      </section>
+
+      <section id="metrics">
+        <h2>Metrics</h2>
+        <p>Pass <code>--metrics-addr</code> to expose Prometheus metrics over plain HTTP at <code>/metrics</code>:</p>
+        <pre><code>./target/release/mini-dns --metrics-addr 127.0.0.1:9090
+curl http://127.0.0.1:9090/metrics</code></pre>
+      </section>
+
+      <section id="query">
+        <h2>Querying</h2>
+        <pre><code>dig @127.0.0.1 -p 8888 example.com A
+dig +tcp @127.0.0.1 -p 8888 example.com A   # force TCP
+dig @127.0.0.1 -p 8888 google.com A         # forwarded recursively
+
+# DNS-over-TLS (requires a DoT-capable client, e.g. kdig)
+kdig +tls @127.0.0.1 -p 8853 example.com A
+
+# DNS-over-HTTPS over HTTP/2 (raw DNS message via curl; -k trusts the self-signed cert)
+printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01' \
+  | curl -sk --http2 -H 'content-type: application/dns-message' \
+      --data-binary @- https://127.0.0.1:8443/dns-query | xxd</code></pre>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <div class="wrap">
+      <p>mini-dns — <a href="https://github.com/uy-td-dev/mini-dns">source on GitHub</a>.</p>
+    </div>
+  </footer>
+</body>
+</html>
