@@ -1,10 +1,13 @@
+use crate::doh;
 use crate::state::{ServerState, Transport};
 use anyhow::{Context, Result};
 use std::io::ErrorKind;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 /// The address the server binds to when none is provided.
@@ -12,6 +15,13 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:8888";
 
 /// How often the server logs a metrics summary.
 const METRICS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Optional encrypted-transport listeners (DoT / DoH), sharing one TLS config.
+pub struct TlsOptions {
+    pub acceptor: TlsAcceptor,
+    pub dot_addr: Option<String>,
+    pub doh_addr: Option<String>,
+}
 
 /// Binds a UDP socket to `addr` and returns it.
 ///
@@ -24,20 +34,41 @@ pub async fn bind(addr: &str) -> Result<Arc<UdpSocket>> {
     Ok(Arc::new(socket))
 }
 
-/// Binds a TCP listener to `addr` for DNS-over-TCP.
+/// Binds a TCP listener to `addr` (used for DNS-over-TCP, DoT and DoH).
 pub async fn bind_tcp(addr: &str) -> Result<TcpListener> {
     TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind TCP listener to {addr}"))
 }
 
-/// `run` binds UDP and TCP on `addr` and serves DNS queries on both, also
-/// spawning a metrics reporter and (on Unix) a SIGHUP zone-reload handler.
-pub async fn run(state: Arc<ServerState>, addr: &str) -> Result<()> {
+/// `run` binds UDP and TCP on `addr` (and optionally DoT/DoH), serving DNS
+/// queries on all transports, plus a metrics reporter and SIGHUP reload handler.
+pub async fn run(state: Arc<ServerState>, addr: &str, tls: Option<TlsOptions>) -> Result<()> {
     let udp = bind(addr).await?;
     let local = udp.local_addr()?;
     let tcp = bind_tcp(addr).await?;
     info!(%local, "DNS server listening (UDP + TCP)");
+
+    if let Some(tls) = tls {
+        if let Some(dot_addr) = &tls.dot_addr {
+            let listener = bind_tcp(dot_addr).await?;
+            info!(addr = %dot_addr, "DNS-over-TLS listening");
+            tokio::spawn(serve_dot(
+                Arc::clone(&state),
+                listener,
+                tls.acceptor.clone(),
+            ));
+        }
+        if let Some(doh_addr) = &tls.doh_addr {
+            let listener = bind_tcp(doh_addr).await?;
+            info!(addr = %doh_addr, "DNS-over-HTTPS listening");
+            tokio::spawn(serve_doh(
+                Arc::clone(&state),
+                listener,
+                tls.acceptor.clone(),
+            ));
+        }
+    }
 
     spawn_metrics_reporter(Arc::clone(&state));
     spawn_reload_handler(Arc::clone(&state));
@@ -73,27 +104,74 @@ pub async fn serve(state: Arc<ServerState>, socket: Arc<UdpSocket>) -> Result<()
     }
 }
 
-/// `serve_tcp` accepts DNS-over-TCP connections on an already-bound listener.
+/// `serve_tcp` accepts plaintext DNS-over-TCP connections.
 pub async fn serve_tcp(state: Arc<ServerState>, listener: TcpListener) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_connection(&state, stream, peer.ip()).await {
+            if let Err(e) = handle_dns_stream(&state, stream, peer.ip()).await {
                 warn!(%peer, error = %e, "TCP connection error");
             }
         });
     }
 }
 
-/// Handles a single DNS-over-TCP connection, which may carry multiple queries.
-///
-/// Each message is framed by a 2-byte big-endian length prefix (RFC 1035 §4.2.2).
-async fn handle_tcp_connection(
-    state: &ServerState,
-    mut stream: TcpStream,
-    client: std::net::IpAddr,
+/// `serve_dot` accepts DNS-over-TLS connections, performing the TLS handshake
+/// before handing the (length-framed) stream to the shared DNS handler.
+pub async fn serve_dot(
+    state: Arc<ServerState>,
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
 ) -> Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let state = Arc::clone(&state);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls) => {
+                    if let Err(e) = handle_dns_stream(&state, tls, peer.ip()).await {
+                        warn!(%peer, error = %e, "DoT connection error");
+                    }
+                }
+                Err(e) => warn!(%peer, error = %e, "DoT TLS handshake failed"),
+            }
+        });
+    }
+}
+
+/// `serve_doh` accepts DNS-over-HTTPS connections (HTTP/1.1 over TLS).
+pub async fn serve_doh(
+    state: Arc<ServerState>,
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let state = Arc::clone(&state);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls) => {
+                    if let Err(e) = doh::handle_connection(&state, tls, peer.ip()).await {
+                        warn!(%peer, error = %e, "DoH connection error");
+                    }
+                }
+                Err(e) => warn!(%peer, error = %e, "DoH TLS handshake failed"),
+            }
+        });
+    }
+}
+
+/// Handles length-framed DNS messages on a stream (TCP or TLS).
+///
+/// A connection may carry multiple queries; each is framed by a 2-byte
+/// big-endian length prefix (RFC 1035 §4.2.2).
+pub async fn handle_dns_stream<S>(state: &ServerState, mut stream: S, client: IpAddr) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         let mut len_buf = [0u8; 2];
         match stream.read_exact(&mut len_buf).await {

@@ -8,11 +8,13 @@ use mini_dns::cache::Cache;
 use mini_dns::config;
 use mini_dns::forwarder::Forwarder;
 use mini_dns::ratelimit::RateLimiter;
-use mini_dns::server;
+use mini_dns::server::{self, TlsOptions};
 use mini_dns::state::ServerState;
+use mini_dns::tls;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_rustls::TlsAcceptor;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -43,6 +45,22 @@ struct Args {
     /// Maximum number of cached entries for forwarded answers.
     #[arg(long, default_value_t = 1024)]
     cache_size: usize,
+
+    /// Enable DNS-over-TLS on this address (e.g. 127.0.0.1:8853).
+    #[arg(long, env = "MINI_DNS_DOT_ADDR")]
+    dot_addr: Option<String>,
+
+    /// Enable DNS-over-HTTPS on this address (e.g. 127.0.0.1:8443).
+    #[arg(long, env = "MINI_DNS_DOH_ADDR")]
+    doh_addr: Option<String>,
+
+    /// TLS certificate (PEM). If omitted with DoT/DoH, a self-signed cert is generated.
+    #[arg(long, env = "MINI_DNS_TLS_CERT")]
+    tls_cert: Option<String>,
+
+    /// TLS private key (PEM). Required together with --tls-cert.
+    #[arg(long, env = "MINI_DNS_TLS_KEY")]
+    tls_key: Option<String>,
 
     /// Increase log verbosity (use -v for debug, -vv for trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -100,6 +118,26 @@ async fn main() -> Result<()> {
         limiter,
     ));
 
+    // Configure encrypted transports (DoT / DoH) if any address was given.
+    let tls = if args.dot_addr.is_some() || args.doh_addr.is_some() {
+        // ALPN advertises both protocols; each client negotiates its own.
+        let assets = tls::build(
+            args.tls_cert.as_deref(),
+            args.tls_key.as_deref(),
+            vec![b"dot".to_vec(), b"http/1.1".to_vec()],
+        )?;
+        if args.tls_cert.is_none() {
+            info!("no TLS certificate provided; using a generated self-signed cert");
+        }
+        Some(TlsOptions {
+            acceptor: TlsAcceptor::from(assets.config),
+            dot_addr: args.dot_addr.clone(),
+            doh_addr: args.doh_addr.clone(),
+        })
+    } else {
+        None
+    };
+
     // Start the DNS server.
-    server::run(state, &args.addr).await
+    server::run(state, &args.addr, tls).await
 }

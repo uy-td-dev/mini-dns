@@ -5,8 +5,10 @@
 pub mod cache;
 pub mod config;
 pub mod dns;
+pub mod doh;
 pub mod forwarder;
 pub mod metrics;
 pub mod ratelimit;
 pub mod server;
 pub mod state;
+pub mod tls;

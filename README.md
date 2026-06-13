@@ -11,6 +11,7 @@ A lightweight DNS server implementation in Rust. It serves an authoritative zone
 - UDP with 512-byte truncation (`TC` bit) and TCP fallback
 - Name compression on responses
 - **Recursive forwarding** to an upstream resolver with a **TTL cache**
+- **Encrypted transports**: DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH, HTTP/1.1)
 - **Per-client rate limiting** to mitigate floods/amplification
 - **Hot zone reload** on `SIGHUP` (no restart needed)
 - In-process **metrics** logged periodically
@@ -73,6 +74,10 @@ Settings can be supplied via CLI flags or environment variables (flags take prec
 | `--no-recurse`   | —                   | Disable forwarding; serve only the local zone| off                  |
 | `--rate-limit`   | `MINI_DNS_RATE_LIMIT`| Max queries/client/sec (`0` = unlimited)    | `0`                  |
 | `--cache-size`   | —                   | Max cached forwarded answers                 | `1024`               |
+| `--dot-addr`     | `MINI_DNS_DOT_ADDR` | Enable DNS-over-TLS on this address          | disabled             |
+| `--doh-addr`     | `MINI_DNS_DOH_ADDR` | Enable DNS-over-HTTPS on this address        | disabled             |
+| `--tls-cert`     | `MINI_DNS_TLS_CERT` | TLS certificate (PEM)                        | self-signed          |
+| `--tls-key`      | `MINI_DNS_TLS_KEY`  | TLS private key (PEM)                         | self-signed          |
 | `-v`, `--verbose`| —                   | Increase log verbosity (`-v`, `-vv`)         | INFO level           |
 
 Log level can also be controlled with the `RUST_LOG` environment variable. For example, to serve a custom zone on port 5353, forward to Cloudflare, and rate-limit to 50 q/s per client:
@@ -94,10 +99,28 @@ Send `SIGHUP` to reload the zone file in place, without dropping in-flight queri
 kill -HUP $(pgrep mini-dns)
 ```
 
+### Encrypted transports (DoT / DoH)
+
+Enable DNS-over-TLS and/or DNS-over-HTTPS by giving them an address. If no certificate is provided, a self-signed certificate for `localhost` is generated at startup (for local testing only):
+
+```bash
+./target/release/mini-dns --dot-addr 127.0.0.1:8853 --doh-addr 127.0.0.1:8443
+```
+
+DoH exposes `/dns-query` (RFC 8484) over HTTP/1.1, accepting `POST` with an `application/dns-message` body or `GET ?dns=<base64url>`.
+
 ### Querying
 
 ```bash
 dig @127.0.0.1 -p 8888 example.com A
 dig +tcp @127.0.0.1 -p 8888 example.com A   # force TCP
 dig @127.0.0.1 -p 8888 google.com A         # forwarded recursively
+
+# DNS-over-TLS (requires a DoT-capable client, e.g. kdig)
+kdig +tls @127.0.0.1 -p 8853 example.com A
+
+# DNS-over-HTTPS (raw DNS message via curl; -k trusts the self-signed cert)
+printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01' \
+  | curl -sk --http1.1 -H 'content-type: application/dns-message' \
+      --data-binary @- https://127.0.0.1:8443/dns-query | xxd
 ```
