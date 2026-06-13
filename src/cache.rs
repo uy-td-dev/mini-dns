@@ -52,6 +52,17 @@ impl Cache {
         None
     }
 
+    /// The number of entries currently held (including any not-yet-evicted
+    /// expired ones).
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the cache currently holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// Caches `response` for `(name, qtype)`, expiring after `ttl_secs` seconds.
     /// A `ttl_secs` of zero (or empty response) is not cached.
     pub fn insert(&self, name: &str, qtype: u16, response: Vec<u8>, ttl_secs: u32) {
@@ -59,9 +70,8 @@ impl Cache {
             return;
         }
         let key = (name.to_lowercase(), qtype);
-        // Naive capacity bound: clear when full. Adequate for a small cache.
-        if self.map.len() >= self.capacity && !self.map.contains_key(&key) {
-            self.map.clear();
+        if !self.map.contains_key(&key) {
+            self.evict_if_full();
         }
         self.map.insert(
             key,
@@ -70,6 +80,30 @@ impl Cache {
                 expires_at: Instant::now() + Duration::from_secs(ttl_secs as u64),
             },
         );
+    }
+
+    /// Keeps the cache within `capacity` before inserting a new key.
+    ///
+    /// Reclaims expired entries first; if that doesn't free space, drops a
+    /// single live entry. This avoids the "wipe everything" cliff a naive
+    /// `clear()` would cause, so a burst of misses can't evict the whole hot
+    /// set at once. Eviction of a live entry is approximate (not strict LRU),
+    /// which is an acceptable trade-off for a small response cache.
+    fn evict_if_full(&self) {
+        if self.map.len() < self.capacity {
+            return;
+        }
+        let now = Instant::now();
+        self.map.retain(|_, entry| entry.expires_at > now);
+        if self.map.len() >= self.capacity {
+            // Still full of live entries: drop one to make room. The key is
+            // cloned out first so the iterator's shard lock is released before
+            // `remove` runs.
+            let victim = self.map.iter().next().map(|e| e.key().clone());
+            if let Some(victim) = victim {
+                self.map.remove(&victim);
+            }
+        }
     }
 }
 
@@ -97,5 +131,29 @@ mod tests {
         let cache = Cache::new(8);
         cache.insert("example.com", 1, vec![], 3600);
         assert!(cache.get("example.com", 1).is_none());
+    }
+
+    #[test]
+    fn full_cache_evicts_incrementally_not_wholesale() {
+        let cache = Cache::new(4);
+        for i in 0..4u8 {
+            cache.insert(&format!("d{i}.example"), 1, vec![i], 3600);
+        }
+        // Cache is now full of live entries; inserting one more must make room
+        // incrementally, not wipe the entire hot set (the old `clear()` cliff).
+        cache.insert("new.example", 1, vec![99], 3600);
+
+        // Size stays bounded at capacity.
+        assert_eq!(cache.len(), 4);
+        // The newest entry is present.
+        assert_eq!(*cache.get("new.example", 1).unwrap(), vec![99]);
+        // We dropped at most one prior entry — not all of them.
+        let survivors = (0..4u8)
+            .filter(|i| cache.get(&format!("d{i}.example"), 1).is_some())
+            .count();
+        assert!(
+            survivors >= 3,
+            "expected incremental eviction, only {survivors} of 4 survived"
+        );
     }
 }

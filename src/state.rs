@@ -128,6 +128,14 @@ impl ServerState {
         self.forwarder.is_some()
     }
 
+    /// Reclaims rate-limiter state for clients whose window has elapsed.
+    ///
+    /// Called periodically by a background task to bound memory under a flood of
+    /// many distinct (e.g. spoofed) source addresses.
+    pub fn cleanup_rate_limiter(&self) {
+        self.limiter.cleanup();
+    }
+
     /// Resolves a raw request, awaiting upstream forwarding when needed.
     ///
     /// Connection-based transports (TCP/DoT/DoH) use this directly. The UDP

@@ -2,8 +2,8 @@ use crate::config::Zone;
 use crate::dns::encoder::DnsPacketEncoder;
 use crate::dns::header::DnsHeader;
 use crate::dns::question::DnsQuestion;
+use crate::dns::error::{DnsError, Result};
 use crate::dns::record::DnsRecord;
-use anyhow::{bail, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// `DnsPacket` represents a DNS packet, including the header, questions, and resource records.
@@ -25,7 +25,7 @@ impl DnsPacket {
     /// Creates a new `DnsPacket` from a byte buffer.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         if buf.len() < 12 {
-            bail!("Buffer too small for DNS header");
+            return Err(DnsError::Truncated { what: "header" });
         }
 
         let header = DnsHeader {
@@ -45,7 +45,7 @@ impl DnsPacket {
             offset = new_offset;
 
             if offset + 4 > buf.len() {
-                bail!("Buffer too small for question");
+                return Err(DnsError::Truncated { what: "question" });
             }
             let qtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
             let qclass = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
@@ -100,7 +100,9 @@ impl DnsPacket {
         let (domain, mut new_offset) = Self::parse_qname(buf, offset)?;
 
         if new_offset + 10 > buf.len() {
-            bail!("Buffer too small for record header");
+            return Err(DnsError::Truncated {
+                what: "record header",
+            });
         }
 
         let record_type = u16::from_be_bytes([buf[new_offset], buf[new_offset + 1]]);
@@ -116,14 +118,18 @@ impl DnsPacket {
         new_offset += 10;
 
         if new_offset + data_len > buf.len() {
-            bail!("Buffer overflow reading record data");
+            return Err(DnsError::Truncated {
+                what: "record data",
+            });
         }
 
         let record_data_start = new_offset;
         let record = match record_type {
             DnsRecord::TYPE_A => {
                 if data_len != 4 {
-                    bail!("Invalid A record data length");
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_A,
+                    });
                 }
                 let addr = Ipv4Addr::new(
                     buf[record_data_start],
@@ -135,7 +141,9 @@ impl DnsPacket {
             }
             DnsRecord::TYPE_AAAA => {
                 if data_len != 16 {
-                    bail!("Invalid AAAA record data length");
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_AAAA,
+                    });
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&buf[record_data_start..record_data_start + 16]);
@@ -151,7 +159,9 @@ impl DnsPacket {
             }
             DnsRecord::TYPE_MX => {
                 if data_len < 3 {
-                    bail!("Invalid MX record data length");
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_MX,
+                    });
                 }
                 let preference =
                     u16::from_be_bytes([buf[record_data_start], buf[record_data_start + 1]]);
@@ -181,7 +191,7 @@ impl DnsPacket {
                 let (mname, after_mname) = Self::parse_qname(buf, record_data_start)?;
                 let (rname, after_rname) = Self::parse_qname(buf, after_mname)?;
                 if after_rname + 20 > buf.len() {
-                    bail!("Buffer too small for SOA record");
+                    return Err(DnsError::Truncated { what: "SOA record" });
                 }
                 let read_u32 = |p: usize| {
                     u32::from_be_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]])
@@ -200,7 +210,9 @@ impl DnsPacket {
             }
             DnsRecord::TYPE_SRV => {
                 if data_len < 6 {
-                    bail!("Invalid SRV record data length");
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_SRV,
+                    });
                 }
                 let priority =
                     u16::from_be_bytes([buf[record_data_start], buf[record_data_start + 1]]);
@@ -228,12 +240,16 @@ impl DnsPacket {
             }
             DnsRecord::TYPE_CAA => {
                 if data_len < 2 {
-                    bail!("Invalid CAA record data length");
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_CAA,
+                    });
                 }
                 let flags = buf[record_data_start];
                 let tag_len = buf[record_data_start + 1] as usize;
                 if 2 + tag_len > data_len {
-                    bail!("Invalid CAA tag length");
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_CAA,
+                    });
                 }
                 let tag_start = record_data_start + 2;
                 let tag = String::from_utf8_lossy(&buf[tag_start..tag_start + tag_len]).into_owned();
@@ -265,7 +281,9 @@ impl DnsPacket {
             let len = data[i] as usize;
             i += 1;
             if i + len > data.len() {
-                bail!("Buffer overflow reading TXT character-string");
+                return Err(DnsError::Truncated {
+                    what: "TXT character-string",
+                });
             }
             text.push_str(&String::from_utf8_lossy(&data[i..i + len]));
             i += len;
@@ -290,17 +308,21 @@ impl DnsPacket {
 
         loop {
             if current >= buf.len() {
-                bail!("Buffer overflow while parsing qname label length");
+                return Err(DnsError::Truncated {
+                    what: "qname label length",
+                });
             }
             let len = buf[current] as usize;
 
             if (len & 0b1100_0000) != 0 {
                 if current + 1 >= buf.len() {
-                    bail!("Buffer overflow while parsing pointer");
+                    return Err(DnsError::Truncated {
+                        what: "compression pointer",
+                    });
                 }
                 jumps += 1;
                 if jumps > Self::MAX_POINTER_JUMPS {
-                    bail!("Too many compression pointers (possible pointer loop)");
+                    return Err(DnsError::PointerLoop);
                 }
                 if !jumped {
                     end_offset = current + 2;
@@ -320,7 +342,7 @@ impl DnsPacket {
             }
             current += 1;
             if current + len > buf.len() {
-                bail!("Buffer overflow while parsing qname label");
+                return Err(DnsError::Truncated { what: "qname label" });
             }
             qname.push_str(&String::from_utf8_lossy(&buf[current..current + len]));
             qname.push('.');
@@ -379,116 +401,50 @@ impl DnsPacket {
         truncated.to_bytes()
     }
 
-    /// The maximum number of CNAME records followed when resolving a query,
-    /// guarding against accidental or malicious CNAME loops.
-    const MAX_CNAME_CHAIN: usize = 16;
-
-    /// Builds a response packet for the current query.
+    /// Builds a response packet for the current query against `zone`.
     ///
-    /// Resolution honours the question type, supports `*` wildcard records, and
-    /// follows CNAME chains within the zone (appending each CNAME and the final
-    /// target's records). The AA bit is set when the server is authoritative for
-    /// the name, and NXDOMAIN is returned when the original name does not exist.
+    /// Delegates to [`super::resolver::build_response`]; the resolution logic
+    /// (wildcards, CNAME chasing, AA/NXDOMAIN/NODATA) lives there, separate from
+    /// this module's wire (de)serialisation concerns.
     pub fn build_response(&self, zone: &Zone) -> DnsPacket {
-        let mut answers = Vec::new();
-        let mut authoritative = false;
-        let mut rcode = 0u16; // NOERROR
+        crate::dns::resolver::build_response(self, zone)
+    }
+}
 
-        if let Some(question) = self.questions.first() {
-            let qtype = question.qtype;
-            // DNS names are case-insensitive, so match against a normalized key.
-            let mut name = question.qname.to_lowercase();
-            let mut seen = std::collections::HashSet::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            for _ in 0..Self::MAX_CNAME_CHAIN {
-                if !seen.insert(name.clone()) {
-                    break; // CNAME loop detected
-                }
-
-                let Some(records) = Self::lookup(zone, &name) else {
-                    // Original name missing -> NXDOMAIN; a dangling CNAME target
-                    // simply ends the chain with what we have so far.
-                    if answers.is_empty() {
-                        rcode = 3; // NXDOMAIN
-                    }
-                    break;
-                };
-                authoritative = true;
-
-                // Direct records of the requested type answer the query.
-                let direct: Vec<&DnsRecord> =
-                    records.iter().filter(|r| r.record_type() == qtype).collect();
-                if !direct.is_empty() {
-                    for r in direct {
-                        answers.push(r.with_domain(name.clone()));
-                    }
-                    break;
-                }
-
-                // Otherwise, follow a CNAME if present (unless CNAME was asked for).
-                if let Some(cname) = records
-                    .iter()
-                    .find(|r| r.record_type() == DnsRecord::TYPE_CNAME)
-                {
-                    answers.push(cname.with_domain(name.clone()));
-                    if let DnsRecord::CNAME { alias, .. } = cname {
-                        name = alias.to_lowercase();
-                        continue;
-                    }
-                }
-
-                break; // name exists but no matching type and no CNAME -> NODATA
-            }
-        }
-
-        // QR=1 (response). Preserve the client's RD bit; RA stays 0 because this
-        // server does not perform recursion.
-        let mut flags = 0x8000 | (self.header.flags & 0x0100) | rcode;
-        if authoritative {
-            flags |= 0x0400; // AA
-        }
-
-        // EDNS(0): if the client sent an OPT record, echo one back advertising
-        // the negotiated UDP payload size (also used as the truncation limit).
-        let mut additionals = Vec::new();
-        if let Some(client_size) = self.edns_udp_size() {
-            let negotiated = client_size.clamp(Self::MAX_UDP_SIZE as u16, Self::MAX_EDNS_UDP as u16);
-            additionals.push(DnsRecord::OPT {
-                udp_size: negotiated,
-            });
-        }
-
-        DnsPacket {
-            header: DnsHeader {
-                id: self.header.id,
-                flags,
-                questions: self.questions.len() as u16,
-                answers: answers.len() as u16,
-                authorities: 0,
-                additionals: additionals.len() as u16,
-            },
-            questions: self.questions.clone(),
-            answers,
-            authorities: Vec::new(),
-            additionals,
-        }
+    #[test]
+    fn header_shorter_than_12_bytes_is_truncated() {
+        let err = DnsPacket::from_bytes(&[0u8; 4]).unwrap_err();
+        assert_eq!(err, DnsError::Truncated { what: "header" });
     }
 
-    /// Looks up a name in the zone, falling back to `*` wildcard records.
-    ///
-    /// An exact match wins; otherwise each parent suffix is tried as
-    /// `*.<suffix>` from most to least specific (RFC 4592 style).
-    fn lookup<'a>(zone: &'a Zone, name: &str) -> Option<&'a Vec<DnsRecord>> {
-        if let Some(records) = zone.get(name) {
-            return Some(records);
-        }
-        let mut remainder = name;
-        while let Some(pos) = remainder.find('.') {
-            remainder = &remainder[pos + 1..];
-            if let Some(records) = zone.get(&format!("*.{remainder}")) {
-                return Some(records);
-            }
-        }
-        None
+    #[test]
+    fn question_cut_short_is_truncated() {
+        // Header claims one question, but the buffer ends mid-question.
+        let buf = [
+            0x00, 0x01, // id
+            0x00, 0x00, // flags
+            0x00, 0x01, // 1 question
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // counts
+            0x00, // root name (end of labels) ...but no qtype/qclass follow
+        ];
+        let err = DnsPacket::from_bytes(&buf).unwrap_err();
+        assert_eq!(err, DnsError::Truncated { what: "question" });
+    }
+
+    #[test]
+    fn self_referential_pointer_is_a_loop() {
+        let buf = [
+            0x00, 0x01, // id
+            0x00, 0x00, // flags
+            0x00, 0x01, // 1 question
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // counts
+            0xC0, 0x0C, // pointer at offset 12 -> offset 12 (itself)
+        ];
+        let err = DnsPacket::from_bytes(&buf).unwrap_err();
+        assert_eq!(err, DnsError::PointerLoop);
     }
 }

@@ -54,6 +54,23 @@ impl RateLimiter {
         window.count += 1;
         window.count <= self.max_per_window
     }
+
+    /// The number of distinct clients currently tracked.
+    pub fn tracked_clients(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Drops clients whose current window has fully elapsed.
+    ///
+    /// Such a client would have its window reset on its next query anyway, so
+    /// removing it frees memory without changing rate-limiting behaviour. A
+    /// background task calls this periodically to bound memory under a flood of
+    /// many distinct (e.g. spoofed) source addresses.
+    pub fn cleanup(&self) {
+        let now = Instant::now();
+        self.clients
+            .retain(|_, window| now.duration_since(window.started_at) < self.window);
+    }
 }
 
 #[cfg(test)]
@@ -83,5 +100,27 @@ mod tests {
 
         // A different client has its own budget.
         assert!(limiter.allow(ip(2)));
+    }
+
+    #[test]
+    fn cleanup_drops_idle_clients_bounding_memory() {
+        let limiter = RateLimiter::new(5, Duration::from_millis(10));
+        for i in 0..50 {
+            limiter.allow(ip(i));
+        }
+        assert_eq!(limiter.tracked_clients(), 50);
+
+        // Once every window has elapsed, cleanup must reclaim all of them.
+        std::thread::sleep(Duration::from_millis(25));
+        limiter.cleanup();
+        assert_eq!(limiter.tracked_clients(), 0);
+    }
+
+    #[test]
+    fn cleanup_keeps_clients_within_their_window() {
+        let limiter = RateLimiter::new(5, Duration::from_secs(60));
+        limiter.allow(ip(1));
+        limiter.cleanup(); // window still open -> kept
+        assert_eq!(limiter.tracked_clients(), 1);
     }
 }

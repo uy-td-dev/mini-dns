@@ -24,6 +24,9 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:8888";
 /// How often the server logs a metrics summary.
 const METRICS_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often idle per-client rate-limiter state is reclaimed.
+const LIMITER_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Optional encrypted-transport listeners (DoT / DoH), sharing one TLS config.
 pub struct TlsOptions {
     pub acceptor: TlsAcceptor,
@@ -131,6 +134,7 @@ pub async fn run(
     }
 
     spawn_metrics_reporter(Arc::clone(&state));
+    spawn_limiter_cleanup(Arc::clone(&state));
     spawn_reload_handler(Arc::clone(&state));
 
     // One recv loop per UDP socket; the TCP acceptor runs in the foreground.
@@ -319,6 +323,18 @@ fn spawn_metrics_reporter(state: Arc<ServerState>) {
         loop {
             ticker.tick().await;
             info!(metrics = %state.metrics.summary(), "metrics");
+        }
+    });
+}
+
+/// Periodically reclaims idle per-client rate-limiter state.
+fn spawn_limiter_cleanup(state: Arc<ServerState>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(LIMITER_CLEANUP_INTERVAL);
+        ticker.tick().await; // first tick fires immediately; skip it
+        loop {
+            ticker.tick().await;
+            state.cleanup_rate_limiter();
         }
     });
 }
