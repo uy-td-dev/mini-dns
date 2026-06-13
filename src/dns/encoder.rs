@@ -48,6 +48,12 @@ impl DnsPacketEncoder {
         for answer in &packet.answers {
             self.encode_record(answer);
         }
+        for record in &packet.authorities {
+            self.encode_record(record);
+        }
+        for record in &packet.additionals {
+            self.encode_record(record);
+        }
     }
 
     /// Encodes a single resource record into the buffer.
@@ -113,7 +119,71 @@ impl DnsPacketEncoder {
                     enc.buf.extend_from_slice(&minimum.to_be_bytes());
                 });
             }
+            DnsRecord::SRV {
+                domain,
+                priority,
+                weight,
+                port,
+                target,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_SRV, *ttl);
+                self.encode_rdata(|enc| {
+                    enc.buf.extend_from_slice(&priority.to_be_bytes());
+                    enc.buf.extend_from_slice(&weight.to_be_bytes());
+                    enc.buf.extend_from_slice(&port.to_be_bytes());
+                    // RFC 2782: the SRV target must not be compressed.
+                    enc.encode_name_uncompressed(target);
+                });
+            }
+            DnsRecord::PTR {
+                domain,
+                ptrdname,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_PTR, *ttl);
+                self.encode_rdata(|enc| enc.encode_qname(ptrdname));
+            }
+            DnsRecord::CAA {
+                domain,
+                flags,
+                tag,
+                value,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_CAA, *ttl);
+                self.encode_rdata(|enc| {
+                    enc.buf.push(*flags);
+                    let tag_len = tag.len().min(255);
+                    enc.buf.push(tag_len as u8);
+                    enc.buf.extend_from_slice(&tag.as_bytes()[..tag_len]);
+                    enc.buf.extend_from_slice(value.as_bytes());
+                });
+            }
+            DnsRecord::OPT { udp_size } => {
+                // OPT pseudo-record: root name, type OPT, UDP size in the class
+                // field, extended-rcode/flags in the TTL field, empty rdata.
+                self.buf.push(0); // root domain name
+                self.buf.extend_from_slice(&DnsRecord::TYPE_OPT.to_be_bytes());
+                self.buf.extend_from_slice(&udp_size.to_be_bytes());
+                self.buf.extend_from_slice(&0u32.to_be_bytes());
+                self.buf.extend_from_slice(&0u16.to_be_bytes());
+            }
         }
+    }
+
+    /// Encodes a domain name in label format without using compression pointers.
+    fn encode_name_uncompressed(&mut self, name: &str) {
+        if name.is_empty() {
+            self.buf.push(0);
+            return;
+        }
+        for label in name.split('.') {
+            let len = label.len().min(63);
+            self.buf.push(len as u8);
+            self.buf.extend_from_slice(&label.as_bytes()[..len]);
+        }
+        self.buf.push(0);
     }
 
     /// Writes the common record header (name, type, class IN, TTL).

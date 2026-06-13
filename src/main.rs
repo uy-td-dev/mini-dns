@@ -12,6 +12,7 @@ use mini_dns::server::{self, TlsOptions};
 use mini_dns::state::ServerState;
 use mini_dns::tls;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
@@ -62,6 +63,10 @@ struct Args {
     #[arg(long, env = "MINI_DNS_TLS_KEY")]
     tls_key: Option<String>,
 
+    /// Expose Prometheus metrics over plain HTTP at /metrics on this address.
+    #[arg(long, env = "MINI_DNS_METRICS_ADDR")]
+    metrics_addr: Option<String>,
+
     /// Increase log verbosity (use -v for debug, -vv for trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -77,10 +82,33 @@ fn parse_upstream(s: &str) -> Result<SocketAddr> {
         .with_context(|| format!("invalid upstream address `{s}`"))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Thread-per-core: one runtime worker per core, each pinned to a distinct
+    // core. Combined with the SO_REUSEPORT sockets, this keeps each core's recv
+    // loop on its own CPU and reduces cross-core thread migration. Pinning is
+    // best-effort (a no-op where the OS doesn't support it).
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let worker_threads = core_ids.len().max(1);
+    let next_core = AtomicUsize::new(0);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .on_thread_start(move || {
+            if core_ids.is_empty() {
+                return;
+            }
+            let idx = next_core.fetch_add(1, Ordering::Relaxed) % core_ids.len();
+            core_affinity::set_for_current(core_ids[idx]);
+        })
+        .build()
+        .context("failed to build Tokio runtime")?;
+
+    runtime.block_on(run_server(args))
+}
+
+async fn run_server(args: Args) -> Result<()> {
     // Log level: default to INFO, then RUST_LOG overrides, then -v/-vv overrides.
     let default_level = match args.verbose {
         0 => "info",
@@ -120,11 +148,12 @@ async fn main() -> Result<()> {
 
     // Configure encrypted transports (DoT / DoH) if any address was given.
     let tls = if args.dot_addr.is_some() || args.doh_addr.is_some() {
-        // ALPN advertises both protocols; each client negotiates its own.
+        // ALPN advertises DoT plus HTTP/2 and HTTP/1.1 for DoH; each client
+        // negotiates its own protocol per connection.
         let assets = tls::build(
             args.tls_cert.as_deref(),
             args.tls_key.as_deref(),
-            vec![b"dot".to_vec(), b"http/1.1".to_vec()],
+            vec![b"dot".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()],
         )?;
         if args.tls_cert.is_none() {
             info!("no TLS certificate provided; using a generated self-signed cert");
@@ -139,5 +168,5 @@ async fn main() -> Result<()> {
     };
 
     // Start the DNS server.
-    server::run(state, &args.addr, tls).await
+    server::run(state, &args.addr, tls, args.metrics_addr.as_deref()).await
 }

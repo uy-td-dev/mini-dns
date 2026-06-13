@@ -1,8 +1,7 @@
 //! A simple per-client fixed-window rate limiter.
 
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 struct Window {
@@ -13,11 +12,12 @@ struct Window {
 /// Limits each client IP to at most `max_per_window` queries per `window`.
 ///
 /// A `max_per_window` of zero disables limiting (all queries are allowed). This
-/// guards against floods and DNS amplification abuse.
+/// guards against floods and DNS amplification abuse. Per-IP state lives in a
+/// `DashMap` so different clients hit different shards instead of one mutex.
 pub struct RateLimiter {
     max_per_window: u32,
     window: Duration,
-    clients: Mutex<HashMap<IpAddr, Window>>,
+    clients: DashMap<IpAddr, Window>,
 }
 
 impl RateLimiter {
@@ -27,7 +27,7 @@ impl RateLimiter {
         RateLimiter {
             max_per_window,
             window,
-            clients: Mutex::new(HashMap::new()),
+            clients: DashMap::new(),
         }
     }
 
@@ -42,8 +42,7 @@ impl RateLimiter {
             return true;
         }
         let now = Instant::now();
-        let mut clients = self.clients.lock().unwrap();
-        let window = clients.entry(ip).or_insert(Window {
+        let mut window = self.clients.entry(ip).or_insert(Window {
             started_at: now,
             count: 0,
         });

@@ -106,6 +106,38 @@ fn parse_line(line: &str) -> Result<Option<(String, DnsRecord)>> {
             text: data.trim_matches('"').to_string(),
             ttl,
         },
+        "PTR" => DnsRecord::PTR {
+            domain: domain.clone(),
+            ptrdname: strip_trailing_dot(&data),
+            ttl,
+        },
+        "SRV" => {
+            // SRV data is "<priority> <weight> <port> <target>".
+            if parts.len() < 7 {
+                bail!("SRV record requires priority, weight, port and target");
+            }
+            DnsRecord::SRV {
+                domain: domain.clone(),
+                priority: parts[3].parse().context("invalid SRV priority")?,
+                weight: parts[4].parse().context("invalid SRV weight")?,
+                port: parts[5].parse().context("invalid SRV port")?,
+                target: strip_trailing_dot(parts[6]),
+                ttl,
+            }
+        }
+        "CAA" => {
+            // CAA data is "<flags> <tag> <value>".
+            if parts.len() < 6 {
+                bail!("CAA record requires flags, tag and value");
+            }
+            DnsRecord::CAA {
+                domain: domain.clone(),
+                flags: parts[3].parse().context("invalid CAA flags")?,
+                tag: parts[4].to_string(),
+                value: parts[5..].join(" ").trim_matches('"').to_string(),
+                ttl,
+            }
+        }
         "SOA" => {
             // SOA data is "<mname> <rname> <serial> <refresh> <retry> <expire> <minimum>".
             if parts.len() < 10 {

@@ -58,26 +58,45 @@ impl DnsPacket {
             });
         }
 
-        let mut answers = Vec::new();
-        for _ in 0..header.answers {
-            let (record, new_offset) = Self::parse_record(buf, offset)?;
-            answers.push(record);
-            offset = new_offset;
-        }
+        // Records we don't model are skipped (returned as None) so EDNS OPT in
+        // the additional section is still found and unknown types don't abort.
+        let parse_section = |count: u16, offset: &mut usize| -> Result<Vec<DnsRecord>> {
+            let mut out = Vec::new();
+            for _ in 0..count {
+                let (record, next) = Self::parse_record(buf, *offset)?;
+                if let Some(record) = record {
+                    out.push(record);
+                }
+                *offset = next;
+            }
+            Ok(out)
+        };
 
-        // Note: Authority and Additional records are not parsed for simplicity.
+        let answers = parse_section(header.answers, &mut offset)?;
+        let authorities = parse_section(header.authorities, &mut offset)?;
+        let additionals = parse_section(header.additionals, &mut offset)?;
 
         Ok(DnsPacket {
             header,
             questions,
             answers,
-            authorities: Vec::new(),
-            additionals: Vec::new(),
+            authorities,
+            additionals,
         })
     }
 
-    /// Parses a single resource record from the buffer.
-    fn parse_record(buf: &[u8], offset: usize) -> Result<(DnsRecord, usize)> {
+    /// Returns the EDNS(0) UDP payload size advertised by the sender, if any
+    /// (i.e. an OPT record is present in the additional section).
+    pub fn edns_udp_size(&self) -> Option<u16> {
+        self.additionals.iter().find_map(|r| match r {
+            DnsRecord::OPT { udp_size } => Some(*udp_size),
+            _ => None,
+        })
+    }
+
+    /// Parses a single resource record. Returns `Ok((None, offset))` for record
+    /// types this server does not model (still advancing past them).
+    fn parse_record(buf: &[u8], offset: usize) -> Result<(Option<DnsRecord>, usize)> {
         let (domain, mut new_offset) = Self::parse_qname(buf, offset)?;
 
         if new_offset + 10 > buf.len() {
@@ -85,6 +104,8 @@ impl DnsPacket {
         }
 
         let record_type = u16::from_be_bytes([buf[new_offset], buf[new_offset + 1]]);
+        // For OPT the "class" field carries the UDP payload size.
+        let class = u16::from_be_bytes([buf[new_offset + 2], buf[new_offset + 3]]);
         let ttl = u32::from_be_bytes([
             buf[new_offset + 4],
             buf[new_offset + 5],
@@ -110,7 +131,7 @@ impl DnsPacket {
                     buf[record_data_start + 2],
                     buf[record_data_start + 3],
                 );
-                DnsRecord::A { domain, addr, ttl }
+                Some(DnsRecord::A { domain, addr, ttl })
             }
             DnsRecord::TYPE_AAAA => {
                 if data_len != 16 {
@@ -118,15 +139,15 @@ impl DnsPacket {
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&buf[record_data_start..record_data_start + 16]);
-                DnsRecord::AAAA {
+                Some(DnsRecord::AAAA {
                     domain,
                     addr: Ipv6Addr::from(octets),
                     ttl,
-                }
+                })
             }
             DnsRecord::TYPE_CNAME => {
                 let (alias, _) = Self::parse_qname(buf, record_data_start)?;
-                DnsRecord::CNAME { domain, alias, ttl }
+                Some(DnsRecord::CNAME { domain, alias, ttl })
             }
             DnsRecord::TYPE_MX => {
                 if data_len < 3 {
@@ -135,26 +156,26 @@ impl DnsPacket {
                 let preference =
                     u16::from_be_bytes([buf[record_data_start], buf[record_data_start + 1]]);
                 let (exchange, _) = Self::parse_qname(buf, record_data_start + 2)?;
-                DnsRecord::MX {
+                Some(DnsRecord::MX {
                     domain,
                     preference,
                     exchange,
                     ttl,
-                }
+                })
             }
             DnsRecord::TYPE_TXT => {
                 let text = Self::parse_character_strings(
                     &buf[record_data_start..record_data_start + data_len],
                 )?;
-                DnsRecord::TXT { domain, text, ttl }
+                Some(DnsRecord::TXT { domain, text, ttl })
             }
             DnsRecord::TYPE_NS => {
                 let (nameserver, _) = Self::parse_qname(buf, record_data_start)?;
-                DnsRecord::NS {
+                Some(DnsRecord::NS {
                     domain,
                     nameserver,
                     ttl,
-                }
+                })
             }
             DnsRecord::TYPE_SOA => {
                 let (mname, after_mname) = Self::parse_qname(buf, record_data_start)?;
@@ -165,7 +186,7 @@ impl DnsPacket {
                 let read_u32 = |p: usize| {
                     u32::from_be_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]])
                 };
-                DnsRecord::SOA {
+                Some(DnsRecord::SOA {
                     domain,
                     mname,
                     rname,
@@ -175,9 +196,60 @@ impl DnsPacket {
                     expire: read_u32(after_rname + 12),
                     minimum: read_u32(after_rname + 16),
                     ttl,
-                }
+                })
             }
-            _ => bail!("Unsupported record type: {}", record_type),
+            DnsRecord::TYPE_SRV => {
+                if data_len < 6 {
+                    bail!("Invalid SRV record data length");
+                }
+                let priority =
+                    u16::from_be_bytes([buf[record_data_start], buf[record_data_start + 1]]);
+                let weight =
+                    u16::from_be_bytes([buf[record_data_start + 2], buf[record_data_start + 3]]);
+                let port =
+                    u16::from_be_bytes([buf[record_data_start + 4], buf[record_data_start + 5]]);
+                let (target, _) = Self::parse_qname(buf, record_data_start + 6)?;
+                Some(DnsRecord::SRV {
+                    domain,
+                    priority,
+                    weight,
+                    port,
+                    target,
+                    ttl,
+                })
+            }
+            DnsRecord::TYPE_PTR => {
+                let (ptrdname, _) = Self::parse_qname(buf, record_data_start)?;
+                Some(DnsRecord::PTR {
+                    domain,
+                    ptrdname,
+                    ttl,
+                })
+            }
+            DnsRecord::TYPE_CAA => {
+                if data_len < 2 {
+                    bail!("Invalid CAA record data length");
+                }
+                let flags = buf[record_data_start];
+                let tag_len = buf[record_data_start + 1] as usize;
+                if 2 + tag_len > data_len {
+                    bail!("Invalid CAA tag length");
+                }
+                let tag_start = record_data_start + 2;
+                let tag = String::from_utf8_lossy(&buf[tag_start..tag_start + tag_len]).into_owned();
+                let value =
+                    String::from_utf8_lossy(&buf[tag_start + tag_len..record_data_start + data_len])
+                        .into_owned();
+                Some(DnsRecord::CAA {
+                    domain,
+                    flags,
+                    tag,
+                    value,
+                    ttl,
+                })
+            }
+            DnsRecord::TYPE_OPT => Some(DnsRecord::OPT { udp_size: class }),
+            _ => None, // unmodelled type: skip, advancing past its rdata
         };
 
         new_offset += data_len;
@@ -265,18 +337,29 @@ impl DnsPacket {
     /// The maximum size of a DNS message sent over UDP without EDNS (RFC 1035).
     pub const MAX_UDP_SIZE: usize = 512;
 
+    /// Upper bound on the EDNS UDP payload size we accept (conservative path MTU).
+    pub const MAX_EDNS_UDP: usize = 1232;
+
     /// Converts the `DnsPacket` to a byte vector using the `DnsPacketEncoder`.
     pub fn to_bytes(&self) -> Vec<u8> {
         DnsPacketEncoder::to_bytes(self)
     }
 
-    /// Encodes the packet for transmission over UDP, enforcing the 512-byte
-    /// limit. If the full message would exceed the limit, the answer section is
-    /// dropped and the TC (truncation) bit is set so the client knows to retry
-    /// over TCP.
+    /// The UDP size limit for this packet: the EDNS-advertised size if an OPT
+    /// record is present (clamped), otherwise the classic 512 bytes.
+    fn udp_limit(&self) -> usize {
+        self.edns_udp_size()
+            .map(|s| (s as usize).clamp(Self::MAX_UDP_SIZE, Self::MAX_EDNS_UDP))
+            .unwrap_or(Self::MAX_UDP_SIZE)
+    }
+
+    /// Encodes the packet for transmission over UDP, enforcing the size limit
+    /// (512 bytes, or the EDNS-negotiated size). If the full message would
+    /// exceed the limit, the answer section is dropped and the TC (truncation)
+    /// bit is set so the client knows to retry over TCP. Any OPT record is kept.
     pub fn to_udp_bytes(&self) -> Vec<u8> {
         let bytes = self.to_bytes();
-        if bytes.len() <= Self::MAX_UDP_SIZE {
+        if bytes.len() <= self.udp_limit() {
             return bytes;
         }
 
@@ -285,13 +368,13 @@ impl DnsPacket {
                 flags: self.header.flags | 0x0200, // TC bit
                 answers: 0,
                 authorities: 0,
-                additionals: 0,
+                additionals: self.additionals.len() as u16,
                 ..self.header
             },
             questions: self.questions.clone(),
             answers: Vec::new(),
             authorities: Vec::new(),
-            additionals: Vec::new(),
+            additionals: self.additionals.clone(), // keep OPT
         };
         truncated.to_bytes()
     }
@@ -365,6 +448,16 @@ impl DnsPacket {
             flags |= 0x0400; // AA
         }
 
+        // EDNS(0): if the client sent an OPT record, echo one back advertising
+        // the negotiated UDP payload size (also used as the truncation limit).
+        let mut additionals = Vec::new();
+        if let Some(client_size) = self.edns_udp_size() {
+            let negotiated = client_size.clamp(Self::MAX_UDP_SIZE as u16, Self::MAX_EDNS_UDP as u16);
+            additionals.push(DnsRecord::OPT {
+                udp_size: negotiated,
+            });
+        }
+
         DnsPacket {
             header: DnsHeader {
                 id: self.header.id,
@@ -372,12 +465,12 @@ impl DnsPacket {
                 questions: self.questions.len() as u16,
                 answers: answers.len() as u16,
                 authorities: 0,
-                additionals: 0,
+                additionals: additionals.len() as u16,
             },
             questions: self.questions.clone(),
             answers,
             authorities: Vec::new(),
-            additionals: Vec::new(),
+            additionals,
         }
     }
 

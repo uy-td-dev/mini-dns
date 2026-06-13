@@ -177,6 +177,118 @@ fn test_ns_soa_round_trip() {
     }
 }
 
+/// SRV, PTR and CAA answer records must survive an encode/decode round-trip.
+#[test]
+fn test_srv_ptr_caa_round_trip() {
+    let answers = vec![
+        DnsRecord::SRV {
+            domain: "_sip._tcp.example.com".to_string(),
+            priority: 10,
+            weight: 60,
+            port: 5060,
+            target: "sip.example.com".to_string(),
+            ttl: 3600,
+        },
+        DnsRecord::PTR {
+            domain: "1.2.0.192.in-addr.arpa".to_string(),
+            ptrdname: "host.example.com".to_string(),
+            ttl: 3600,
+        },
+        DnsRecord::CAA {
+            domain: "example.com".to_string(),
+            flags: 0,
+            tag: "issue".to_string(),
+            value: "letsencrypt.org".to_string(),
+            ttl: 3600,
+        },
+    ];
+    let packet = DnsPacket {
+        header: DnsHeader {
+            id: 0x4244,
+            flags: 0x8180,
+            questions: 0,
+            answers: answers.len() as u16,
+            authorities: 0,
+            additionals: 0,
+        },
+        questions: vec![],
+        answers,
+        authorities: vec![],
+        additionals: vec![],
+    };
+
+    let decoded = DnsPacket::from_bytes(&packet.to_bytes()).unwrap();
+    assert_eq!(decoded.answers.len(), 3);
+    match &decoded.answers[0] {
+        DnsRecord::SRV {
+            priority,
+            weight,
+            port,
+            target,
+            ..
+        } => {
+            assert_eq!((*priority, *weight, *port), (10, 60, 5060));
+            assert_eq!(target, "sip.example.com");
+        }
+        other => panic!("expected SRV, got {:?}", other),
+    }
+    match &decoded.answers[1] {
+        DnsRecord::PTR { ptrdname, .. } => assert_eq!(ptrdname, "host.example.com"),
+        other => panic!("expected PTR, got {:?}", other),
+    }
+    match &decoded.answers[2] {
+        DnsRecord::CAA { tag, value, .. } => {
+            assert_eq!(tag, "issue");
+            assert_eq!(value, "letsencrypt.org");
+        }
+        other => panic!("expected CAA, got {:?}", other),
+    }
+}
+
+/// A query carrying an EDNS OPT record must get an OPT echoed in the response,
+/// and the negotiated UDP size must be clamped to the server's maximum.
+#[test]
+fn test_edns_opt_echoed() {
+    let mut zone = Zone::new();
+    zone.insert(
+        "example.com".to_string(),
+        vec![DnsRecord::A {
+            domain: "example.com".to_string(),
+            addr: Ipv4Addr::new(192, 0, 2, 1),
+            ttl: 3600,
+        }],
+    );
+
+    let query = DnsPacket {
+        header: DnsHeader {
+            id: 7,
+            flags: 0x0100,
+            questions: 1,
+            answers: 0,
+            authorities: 0,
+            additionals: 1,
+        },
+        questions: vec![DnsQuestion {
+            qname: "example.com".to_string(),
+            qtype: 1,
+            qclass: 1,
+        }],
+        answers: vec![],
+        authorities: vec![],
+        additionals: vec![DnsRecord::OPT { udp_size: 4096 }],
+    };
+    assert_eq!(query.edns_udp_size(), Some(4096));
+
+    let response = query.build_response(&zone);
+    assert_eq!(response.answers.len(), 1);
+    // 4096 is clamped to the server's max (1232).
+    assert_eq!(response.edns_udp_size(), Some(1232));
+
+    // The OPT must survive encoding (it appears in the additional section).
+    let decoded = DnsPacket::from_bytes(&response.to_bytes()).unwrap();
+    assert_eq!(decoded.edns_udp_size(), Some(1232));
+}
+
 /// Helper to build an A query for `name`.
 fn a_query(name: &str) -> DnsPacket {
     DnsPacket {

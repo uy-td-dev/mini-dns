@@ -4,18 +4,30 @@ A lightweight DNS server implementation in Rust. It serves an authoritative zone
 
 **Features**
 
-- Record types: `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `SOA`
+- Record types: `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `SOA`, `SRV`, `PTR`, `CAA`
 - Wildcard records (`*.example.com`)
 - CNAME chaining (resolves the alias target within the zone in a single response)
 - Case-insensitive lookups, correct `AA` / `NXDOMAIN` / `NODATA` handling
-- UDP with 512-byte truncation (`TC` bit) and TCP fallback
+- **EDNS(0)** — honours the client's UDP payload size (responses beyond 512 bytes)
+- UDP with truncation (`TC` bit) and TCP fallback
 - Name compression on responses
-- **Recursive forwarding** to an upstream resolver with a **TTL cache**
-- **Encrypted transports**: DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH, HTTP/1.1)
+- **Recursive forwarding** to an upstream resolver with a **TTL cache** (positive *and* negative/NXDOMAIN caching)
+- **Prometheus metrics** at `/metrics` (plain HTTP)
+- **Encrypted transports**: DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH over HTTP/1.1 and HTTP/2)
 - **Per-client rate limiting** to mitigate floods/amplification
 - **Hot zone reload** on `SIGHUP` (no restart needed)
 - In-process **metrics** logged periodically
 - Configurable via CLI flags or environment variables, structured logging via `tracing`
+
+**Performance**
+
+- **`SO_REUSEPORT`**: one UDP socket per core so the kernel load-balances ingress across cores instead of funnelling through a single receive loop
+- **Fast path**: local and cached answers are resolved synchronously and sent inline — no task spawn or per-packet allocation; only forwarded queries spawn a task
+- **Thread-per-core**: runtime workers are pinned to CPU cores (best-effort), one per core
+- **Lock-free / sharded state**: zone via `arc-swap`, cache and rate limiter via `DashMap`, metrics sharded and cache-line padded
+- **Single-flight forwarding**: concurrent identical cache misses collapse into one upstream query; upstream sockets are pooled and bounded by a semaphore
+
+> Not yet implemented: `io_uring` + `recvmmsg` batching and a thread-per-core runtime such as `monoio` — these are Linux-only and would replace the Tokio runtime; left as future work.
 
 ## How to run it in production
 
@@ -78,6 +90,7 @@ Settings can be supplied via CLI flags or environment variables (flags take prec
 | `--doh-addr`     | `MINI_DNS_DOH_ADDR` | Enable DNS-over-HTTPS on this address        | disabled             |
 | `--tls-cert`     | `MINI_DNS_TLS_CERT` | TLS certificate (PEM)                        | self-signed          |
 | `--tls-key`      | `MINI_DNS_TLS_KEY`  | TLS private key (PEM)                         | self-signed          |
+| `--metrics-addr` | `MINI_DNS_METRICS_ADDR` | Expose Prometheus `/metrics` (plain HTTP) | disabled             |
 | `-v`, `--verbose`| —                   | Increase log verbosity (`-v`, `-vv`)         | INFO level           |
 
 Log level can also be controlled with the `RUST_LOG` environment variable. For example, to serve a custom zone on port 5353, forward to Cloudflare, and rate-limit to 50 q/s per client:
@@ -107,7 +120,7 @@ Enable DNS-over-TLS and/or DNS-over-HTTPS by giving them an address. If no certi
 ./target/release/mini-dns --dot-addr 127.0.0.1:8853 --doh-addr 127.0.0.1:8443
 ```
 
-DoH exposes `/dns-query` (RFC 8484) over HTTP/1.1, accepting `POST` with an `application/dns-message` body or `GET ?dns=<base64url>`.
+DoH exposes `/dns-query` (RFC 8484) over HTTP/1.1 and HTTP/2 (served by `hyper`, with connection keep-alive), accepting `POST` with an `application/dns-message` body or `GET ?dns=<base64url>`.
 
 ### Querying
 
@@ -119,8 +132,8 @@ dig @127.0.0.1 -p 8888 google.com A         # forwarded recursively
 # DNS-over-TLS (requires a DoT-capable client, e.g. kdig)
 kdig +tls @127.0.0.1 -p 8853 example.com A
 
-# DNS-over-HTTPS (raw DNS message via curl; -k trusts the self-signed cert)
+# DNS-over-HTTPS over HTTP/2 (raw DNS message via curl; -k trusts the self-signed cert)
 printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01' \
-  | curl -sk --http1.1 -H 'content-type: application/dns-message' \
+  | curl -sk --http2 -H 'content-type: application/dns-message' \
       --data-binary @- https://127.0.0.1:8443/dns-query | xxd
 ```

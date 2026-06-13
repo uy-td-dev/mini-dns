@@ -6,3 +6,6 @@ example.com 3600 MX 10 mail.example.com.
 example.com 3600 TXT "v=spf1 -all"
 www.example.com 3600 CNAME example.com
 *.example.com 3600 A 192.0.2.9
+_sip._tcp.example.com 3600 SRV 10 60 5060 sip.example.com.
+example.com 3600 CAA 0 issue "letsencrypt.org"
+4.3.2.1.in-addr.arpa 3600 PTR host.example.com.

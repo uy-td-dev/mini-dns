@@ -57,6 +57,34 @@ pub enum DnsRecord {
         minimum: u32,
         ttl: u32,
     },
+    /// An SRV record, locating the host/port for a service.
+    SRV {
+        domain: String,
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target: String,
+        ttl: u32,
+    },
+    /// A PTR record, mapping a name (typically reverse-DNS) to another name.
+    PTR {
+        domain: String,
+        ptrdname: String,
+        ttl: u32,
+    },
+    /// A CAA record, which authorizes certificate issuance for the domain.
+    CAA {
+        domain: String,
+        flags: u8,
+        tag: String,
+        value: String,
+        ttl: u32,
+    },
+    /// An EDNS(0) OPT pseudo-record (RFC 6891). Carries the sender's advertised
+    /// UDP payload size rather than zone data; never stored in a zone.
+    OPT {
+        udp_size: u16,
+    },
 }
 
 impl DnsRecord {
@@ -74,6 +102,14 @@ impl DnsRecord {
     pub const TYPE_TXT: u16 = 16;
     /// The numeric type code for an AAAA record.
     pub const TYPE_AAAA: u16 = 28;
+    /// The numeric type code for a PTR record.
+    pub const TYPE_PTR: u16 = 12;
+    /// The numeric type code for an SRV record.
+    pub const TYPE_SRV: u16 = 33;
+    /// The numeric type code for an OPT (EDNS) pseudo-record.
+    pub const TYPE_OPT: u16 = 41;
+    /// The numeric type code for a CAA record.
+    pub const TYPE_CAA: u16 = 257;
 
     /// Returns the DNS type code for this record.
     pub fn record_type(&self) -> u16 {
@@ -85,6 +121,10 @@ impl DnsRecord {
             DnsRecord::TXT { .. } => Self::TYPE_TXT,
             DnsRecord::NS { .. } => Self::TYPE_NS,
             DnsRecord::SOA { .. } => Self::TYPE_SOA,
+            DnsRecord::SRV { .. } => Self::TYPE_SRV,
+            DnsRecord::PTR { .. } => Self::TYPE_PTR,
+            DnsRecord::CAA { .. } => Self::TYPE_CAA,
+            DnsRecord::OPT { .. } => Self::TYPE_OPT,
         }
     }
 
@@ -97,11 +137,15 @@ impl DnsRecord {
             | DnsRecord::MX { ttl, .. }
             | DnsRecord::TXT { ttl, .. }
             | DnsRecord::NS { ttl, .. }
-            | DnsRecord::SOA { ttl, .. } => *ttl,
+            | DnsRecord::SOA { ttl, .. }
+            | DnsRecord::SRV { ttl, .. }
+            | DnsRecord::PTR { ttl, .. }
+            | DnsRecord::CAA { ttl, .. } => *ttl,
+            DnsRecord::OPT { .. } => 0,
         }
     }
 
-    /// Returns the domain name (owner) this record belongs to.
+    /// Returns the domain name (owner) this record belongs to (empty for OPT).
     pub fn domain(&self) -> &str {
         match self {
             DnsRecord::A { domain, .. }
@@ -110,14 +154,19 @@ impl DnsRecord {
             | DnsRecord::MX { domain, .. }
             | DnsRecord::TXT { domain, .. }
             | DnsRecord::NS { domain, .. }
-            | DnsRecord::SOA { domain, .. } => domain,
+            | DnsRecord::SOA { domain, .. }
+            | DnsRecord::SRV { domain, .. }
+            | DnsRecord::PTR { domain, .. }
+            | DnsRecord::CAA { domain, .. } => domain,
+            DnsRecord::OPT { .. } => "",
         }
     }
 
     /// Returns a clone of this record with its owner name replaced.
     ///
     /// Used for wildcard synthesis, where a record stored under `*.example.com`
-    /// must be returned with the actual queried name as its owner.
+    /// must be returned with the actual queried name as its owner. OPT has no
+    /// owner, so it is returned unchanged.
     pub fn with_domain(&self, domain: String) -> DnsRecord {
         let mut record = self.clone();
         match &mut record {
@@ -127,7 +176,11 @@ impl DnsRecord {
             | DnsRecord::MX { domain: d, .. }
             | DnsRecord::TXT { domain: d, .. }
             | DnsRecord::NS { domain: d, .. }
-            | DnsRecord::SOA { domain: d, .. } => *d = domain,
+            | DnsRecord::SOA { domain: d, .. }
+            | DnsRecord::SRV { domain: d, .. }
+            | DnsRecord::PTR { domain: d, .. }
+            | DnsRecord::CAA { domain: d, .. } => *d = domain,
+            DnsRecord::OPT { .. } => {}
         }
         record
     }
