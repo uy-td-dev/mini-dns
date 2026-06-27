@@ -1,0 +1,63 @@
+# Sample TOML config for mini-dns. Pass with --config config.toml.
+# CLI flags override these values when both are set.
+
+[server]
+addr = "127.0.0.1:8888"
+# no_recurse = false
+# rate_limit = 50
+# cache_size = 1024
+
+[upstream]
+# When true, resolve iteratively from root servers instead of forwarding.
+# Makes mini-dns a full recursive resolver (no dependency on 8.8.8.8/1.1.1.1).
+# Conditional forwarding rules still apply (matched names go to their upstream).
+# recursive = true
+default = "1.1.1.1:53"
+timeout_secs = 5
+
+# Conditional forwarding: send queries for *.corp.example.com to the internal
+# resolver instead of the public default. Longest-suffix match wins.
+[[upstream.rules]]
+suffix = "corp.example.com"
+upstream = "10.0.0.53:53"
+
+[[upstream.rules]]
+suffix = "internal"
+upstream = "10.0.0.53:53"
+
+# Authoritative zones — serve as many as you like.
+[[zone]]
+origin = "example.com"
+file = "zones/example.zone"
+
+[[zone]]
+origin = "test.local"
+file = "zones/test.zone"
+
+# Encrypted transports (optional). If cert/key are omitted, a self-signed
+# certificate for localhost is generated at startup.
+[tls]
+dot_addr = "127.0.0.1:8853"
+doh_addr = "127.0.0.1:8443"
+# doq_addr = "127.0.0.1:8853"  # DNS-over-QUIC (RFC 9250)
+# cert = "/etc/mini-dns/cert.pem"
+# key = "/etc/mini-dns/key.pem"
+
+[metrics]
+addr = "127.0.0.1:9153"
+
+# Optional: block domains (one per line, ; or # for comments, *.wildcard supported).
+# Blocked queries get a synthesized NXDOMAIN.
+[blocklist]
+file = "zones/blocklist.txt"
+
+# Optional: DNS64 AAAA synthesis (RFC 6147). When an AAAA query has no native
+# AAAA but the name has A records, synthesize AAAA by embedding the IPv4 in the
+# NAT64 prefix. Default well-known prefix is 64:ff9b::/96.
+[dns64]
+prefix = "64:ff9b::"
+
+# Optional: allow zone transfers (AXFR) from these client IPs/CIDRs.
+# Empty or omitted = deny all transfers.
+[axfr]
+allow = ["10.0.0.0/8", "192.168.1.5"]

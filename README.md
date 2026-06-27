@@ -1,23 +1,32 @@
 # mini-dns
 
-A lightweight DNS server implementation in Rust. It serves an authoritative zone file and can optionally forward unknown names to an upstream resolver (recursion), over both **UDP and TCP**.
+A lightweight DNS server implementation in Rust. It serves authoritative zone files and can optionally forward unknown names to an upstream resolver (recursion), over both **UDP and TCP**.
 
 **Features**
 
 - Record types: `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `SOA`, `SRV`, `PTR`, `CAA`
 - Wildcard records (`*.example.com`)
 - CNAME chaining (resolves the alias target within the zone in a single response)
-- Case-insensitive lookups, correct `AA` / `NXDOMAIN` / `NODATA` handling
+- Case-insensitive lookups, correct `AA` / `NXDOMAIN` / `NODATA` handling (SOA in authority section for negative caching, RFC 2308)
 - **EDNS(0)** — honours the client's UDP payload size (responses beyond 512 bytes)
 - UDP with truncation (`TC` bit) and TCP fallback
 - Name compression on responses
 - **Recursive forwarding** to an upstream resolver with a **TTL cache** (positive *and* negative/NXDOMAIN caching)
+- **Full recursive resolver** mode — resolve iteratively from root servers (no dependency on 8.8.8.8/1.1.1.1), with delegation caching
+- **Conditional forwarding** — route queries for specific domains to different upstream resolvers (longest-suffix match)
+- **Multi-zone** — serve as many authoritative zones as you like, with correct per-zone SOA and AA handling
+- **TOML config file** — declarative configuration for zones, forwarding rules, TLS, and metrics; CLI flags override file values
+- **Domain blocklist** (RPZ-style) — block ads/malware domains with wildcard support; hot-reloadable
+- **DNS64** — synthesize AAAA records from A records using a configurable NAT64 prefix (RFC 6147)
+- **Graceful shutdown** — SIGTERM/Ctrl+C drains in-flight queries before exit; `/healthz` endpoint for load balancers
+- **AXFR zone transfer** — with IP-based ACL (CIDR allowlist) for secondary servers
+- **DNSSEC** — DNSKEY/RRSIG/DS/NSEC record types (parse + encode), ED25519 key generation (RFC 8080), and **RRSET signing with signature verification**
 - **Prometheus metrics** at `/metrics` (plain HTTP)
-- **Encrypted transports**: DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH over HTTP/1.1 and HTTP/2)
+- **Encrypted transports**: DNS-over-TLS (DoT), DNS-over-HTTPS (DoH over HTTP/1.1 and HTTP/2), and **DNS-over-QUIC (DoQ, RFC 9250)**
 - **Per-client rate limiting** to mitigate floods/amplification
 - **Hot zone reload** on `SIGHUP` (no restart needed)
 - In-process **metrics** logged periodically
-- Configurable via CLI flags or environment variables, structured logging via `tracing`
+- Configurable via CLI flags, environment variables, or TOML config file; structured logging via `tracing`
 
 **Performance**
 
@@ -92,6 +101,7 @@ Settings can be supplied via CLI flags or environment variables (flags take prec
 | `--tls-key`      | `MINI_DNS_TLS_KEY`  | TLS private key (PEM)                         | self-signed          |
 | `--metrics-addr` | `MINI_DNS_METRICS_ADDR` | Expose Prometheus `/metrics` (plain HTTP) | disabled             |
 | `-v`, `--verbose`| —                   | Increase log verbosity (`-v`, `-vv`)         | INFO level           |
+| `--config`       | `MINI_DNS_CONFIG`   | Path to a TOML config file (see below)       | disabled             |
 
 Log level can also be controlled with the `RUST_LOG` environment variable. For example, to serve a custom zone on port 5353, forward to Cloudflare, and rate-limit to 50 q/s per client:
 
@@ -100,13 +110,53 @@ Log level can also be controlled with the `RUST_LOG` environment variable. For e
     --upstream 1.1.1.1:53 --rate-limit 50 -v
 ```
 
+### TOML config file
+
+For deployments with multiple zones, conditional forwarding rules, or encrypted transports, a TOML config file is easier than a long CLI invocation. A sample is at `config.sample.toml`:
+
+```bash
+./target/release/mini-dns --config /etc/mini-dns/config.toml
+```
+
+```toml
+[server]
+addr = "0.0.0.0:53"
+rate_limit = 50
+
+[upstream]
+default = "1.1.1.1:53"
+timeout_secs = 5
+
+# Conditional forwarding: *.corp.example.com -> internal resolver
+[[upstream.rules]]
+suffix = "corp.example.com"
+upstream = "10.0.0.53:53"
+
+[[zone]]
+origin = "example.com"
+file = "zones/example.zone"
+
+[[zone]]
+origin = "internal"
+file = "zones/internal.zone"
+
+[tls]
+dot_addr = "0.0.0.0:853"
+doh_addr = "0.0.0.0:443"
+
+[metrics]
+addr = "0.0.0.0:9153"
+```
+
+CLI flags override config-file values when both are set, so you can keep the config as defaults and tweak one setting from the command line.
+
 ### Recursion & caching
 
 By default, names not found in the zone are forwarded to the upstream resolver and the answers are cached for their TTL. Use `--no-recurse` to run as a pure authoritative server (returning `NXDOMAIN` for unknown names).
 
 ### Reloading the zone
 
-Send `SIGHUP` to reload the zone file in place, without dropping in-flight queries or restarting:
+Send `SIGHUP` to reload the zone file (or all zones from the config file) in place, without dropping in-flight queries or restarting:
 
 ```bash
 kill -HUP $(pgrep mini-dns)

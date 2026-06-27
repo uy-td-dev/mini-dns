@@ -1,4 +1,4 @@
-use mini_dns::config::Zone;
+use mini_dns::config::{Zone, ZoneSet};
 use mini_dns::dns::header::DnsHeader;
 use mini_dns::dns::packet::DnsPacket;
 use mini_dns::dns::question::DnsQuestion;
@@ -131,7 +131,7 @@ fn test_ns_soa_round_trip() {
             domain: "example.com".to_string(),
             mname: "ns1.example.com".to_string(),
             rname: "admin.example.com".to_string(),
-            serial: 2024_01_01,
+            serial: 20_240_101,
             refresh: 7200,
             retry: 3600,
             expire: 1_209_600,
@@ -170,7 +170,7 @@ fn test_ns_soa_round_trip() {
         } => {
             assert_eq!(mname, "ns1.example.com");
             assert_eq!(rname, "admin.example.com");
-            assert_eq!(*serial, 2024_01_01);
+            assert_eq!(*serial, 20_240_101);
             assert_eq!(*minimum, 3600);
         }
         other => panic!("expected SOA, got {:?}", other),
@@ -279,7 +279,7 @@ fn test_edns_opt_echoed() {
     };
     assert_eq!(query.edns_udp_size(), Some(4096));
 
-    let response = query.build_response(&zone);
+    let response = query.build_response(&ZoneSet::from_records(zone));
     assert_eq!(response.answers.len(), 1);
     // 4096 is clamped to the server's max (1232).
     assert_eq!(response.edns_udp_size(), Some(1232));
@@ -332,7 +332,7 @@ fn test_cname_chaining() {
         }],
     );
 
-    let response = a_query("www.example.com").build_response(&zone);
+    let response = a_query("www.example.com").build_response(&ZoneSet::from_records(zone));
     assert_eq!(response.answers.len(), 2);
     assert!(matches!(response.answers[0], DnsRecord::CNAME { .. }));
     match &response.answers[1] {
@@ -358,7 +358,7 @@ fn test_wildcard_match() {
         }],
     );
 
-    let response = a_query("anything.example.com").build_response(&zone);
+    let response = a_query("anything.example.com").build_response(&ZoneSet::from_records(zone));
     assert_eq!(response.answers.len(), 1);
     match &response.answers[0] {
         DnsRecord::A { addr, domain, .. } => {
@@ -422,7 +422,7 @@ fn test_lookup_is_case_insensitive() {
         additionals: vec![],
     };
 
-    let response = query.build_response(&zone);
+    let response = query.build_response(&ZoneSet::from_records(zone));
     assert_eq!(response.answers.len(), 1);
     assert_eq!(response.header.flags & 0x0400, 0x0400); // AA bit set
 }
@@ -461,11 +461,12 @@ fn test_qtype_filtering() {
     };
 
     // A query (type 1) matches the A record.
-    let a_resp = make_query(1).build_response(&zone);
+    let zones = ZoneSet::from_records(zone);
+    let a_resp = make_query(1).build_response(&zones);
     assert_eq!(a_resp.answers.len(), 1);
 
     // AAAA query (type 28): name exists but no matching type -> NODATA.
-    let aaaa_resp = make_query(28).build_response(&zone);
+    let aaaa_resp = make_query(28).build_response(&zones);
     assert_eq!(aaaa_resp.answers.len(), 0);
     assert_eq!(aaaa_resp.header.flags & 0x000F, 0); // NOERROR
     assert_eq!(aaaa_resp.header.flags & 0x0400, 0x0400); // still authoritative
@@ -494,8 +495,97 @@ fn test_nxdomain() {
         additionals: vec![],
     };
 
-    let response = query.build_response(&zone);
+    let response = query.build_response(&ZoneSet::from_records(zone));
     assert_eq!(response.answers.len(), 0);
     assert_eq!(response.header.flags & 0x000F, 3); // NXDOMAIN
     assert_eq!(response.header.flags & 0x0400, 0); // not authoritative
+}
+
+/// Builds a zone with an SOA at `example.com` plus a single A record.
+fn zone_with_soa() -> Zone {
+    let mut zone = Zone::new();
+    zone.insert(
+        "example.com".to_string(),
+        vec![
+            DnsRecord::SOA {
+                domain: "example.com".to_string(),
+                mname: "ns1.example.com".to_string(),
+                rname: "admin.example.com".to_string(),
+                serial: 1,
+                refresh: 7200,
+                retry: 3600,
+                expire: 1_209_600,
+                minimum: 60,
+                ttl: 3600,
+            },
+            DnsRecord::A {
+                domain: "example.com".to_string(),
+                addr: Ipv4Addr::new(192, 0, 2, 1),
+                ttl: 3600,
+            },
+        ],
+    );
+    zone
+}
+
+/// NXDOMAIN for a name *within* the zone must include the SOA in the authority
+/// section and set AA, so recursive resolvers can negative-cache (RFC 2308).
+#[test]
+fn test_nxdomain_in_zone_has_soa_and_aa() {
+    let zone = zone_with_soa();
+    let query = a_query("nonexistent.example.com");
+    let response = query.build_response(&ZoneSet::from_records(zone));
+
+    assert_eq!(response.answers.len(), 0);
+    assert_eq!(response.header.flags & 0x000F, 3); // NXDOMAIN
+    assert_eq!(response.header.flags & 0x0400, 0x0400); // AA set
+    assert_eq!(response.authorities.len(), 1);
+    assert!(matches!(response.authorities[0], DnsRecord::SOA { .. }));
+}
+
+/// NODATA (name exists, no matching type) must also include the SOA in the
+/// authority section with AA set.
+#[test]
+fn test_nodata_has_soa_and_aa() {
+    let zone = zone_with_soa();
+    // example.com has A but no AAAA -> NODATA for AAAA.
+    let query = DnsPacket {
+        header: DnsHeader {
+            id: 1,
+            flags: 0x0100,
+            questions: 1,
+            answers: 0,
+            authorities: 0,
+            additionals: 0,
+        },
+        questions: vec![DnsQuestion {
+            qname: "example.com".to_string(),
+            qtype: 28, // AAAA
+            qclass: 1,
+        }],
+        answers: vec![],
+        authorities: vec![],
+        additionals: vec![],
+    };
+
+    let response = query.build_response(&ZoneSet::from_records(zone));
+    assert_eq!(response.answers.len(), 0);
+    assert_eq!(response.header.flags & 0x000F, 0); // NOERROR
+    assert_eq!(response.header.flags & 0x0400, 0x0400); // AA set
+    assert_eq!(response.authorities.len(), 1);
+    assert!(matches!(response.authorities[0], DnsRecord::SOA { .. }));
+}
+
+/// NXDOMAIN for a name *outside* the zone must NOT set AA or include SOA — the
+/// server is not authoritative for a foreign name.
+#[test]
+fn test_nxdomain_outside_zone_no_aa_no_soa() {
+    let zone = zone_with_soa();
+    let query = a_query("other.org");
+    let response = query.build_response(&ZoneSet::from_records(zone));
+
+    assert_eq!(response.answers.len(), 0);
+    assert_eq!(response.header.flags & 0x000F, 3); // NXDOMAIN
+    assert_eq!(response.header.flags & 0x0400, 0); // not authoritative
+    assert_eq!(response.authorities.len(), 0);
 }

@@ -85,6 +85,46 @@ pub enum DnsRecord {
     OPT {
         udp_size: u16,
     },
+    /// A DNSKEY record (RFC 4034 §2). Holds a public signing key for the zone.
+    DNSKEY {
+        domain: String,
+        flags: u16,
+        protocol: u8,
+        algorithm: u8,
+        public_key: Vec<u8>,
+        ttl: u32,
+    },
+    /// An RRSIG record (RFC 4034 §3). A signature over an RRset.
+    RRSIG {
+        domain: String,
+        type_covered: u16,
+        algorithm: u8,
+        labels: u8,
+        original_ttl: u32,
+        signature_expiration: u32,
+        signature_inception: u32,
+        key_tag: u16,
+        signer_name: String,
+        signature: Vec<u8>,
+        ttl: u32,
+    },
+    /// A DS record (RFC 4034 §4). A delegation signer digest pointing at a
+    /// child zone's DNSKEY.
+    DS {
+        domain: String,
+        key_tag: u16,
+        algorithm: u8,
+        digest_type: u8,
+        digest: Vec<u8>,
+        ttl: u32,
+    },
+    /// An NSEC record (RFC 4034 §4.1). Provides authenticated denial of existence.
+    NSEC {
+        domain: String,
+        next_name: String,
+        type_bitmap: Vec<u8>,
+        ttl: u32,
+    },
 }
 
 impl DnsRecord {
@@ -108,8 +148,20 @@ impl DnsRecord {
     pub const TYPE_SRV: u16 = 33;
     /// The numeric type code for an OPT (EDNS) pseudo-record.
     pub const TYPE_OPT: u16 = 41;
+    /// The numeric type code for a DS record.
+    pub const TYPE_DS: u16 = 43;
+    /// The numeric type code for an RRSIG record.
+    pub const TYPE_RRSIG: u16 = 46;
+    /// The numeric type code for an NSEC record.
+    pub const TYPE_NSEC: u16 = 47;
+    /// The numeric type code for a DNSKEY record.
+    pub const TYPE_DNSKEY: u16 = 48;
     /// The numeric type code for a CAA record.
     pub const TYPE_CAA: u16 = 257;
+    /// The numeric type code for an AXFR (zone transfer) query.
+    pub const TYPE_AXFR: u16 = 252;
+    /// The numeric type code for an IXFR (incremental zone transfer) query.
+    pub const TYPE_IXFR: u16 = 251;
 
     /// Returns the DNS type code for this record.
     pub fn record_type(&self) -> u16 {
@@ -125,6 +177,10 @@ impl DnsRecord {
             DnsRecord::PTR { .. } => Self::TYPE_PTR,
             DnsRecord::CAA { .. } => Self::TYPE_CAA,
             DnsRecord::OPT { .. } => Self::TYPE_OPT,
+            DnsRecord::DNSKEY { .. } => Self::TYPE_DNSKEY,
+            DnsRecord::RRSIG { .. } => Self::TYPE_RRSIG,
+            DnsRecord::DS { .. } => Self::TYPE_DS,
+            DnsRecord::NSEC { .. } => Self::TYPE_NSEC,
         }
     }
 
@@ -140,7 +196,11 @@ impl DnsRecord {
             | DnsRecord::SOA { ttl, .. }
             | DnsRecord::SRV { ttl, .. }
             | DnsRecord::PTR { ttl, .. }
-            | DnsRecord::CAA { ttl, .. } => *ttl,
+            | DnsRecord::CAA { ttl, .. }
+            | DnsRecord::DNSKEY { ttl, .. }
+            | DnsRecord::RRSIG { ttl, .. }
+            | DnsRecord::DS { ttl, .. }
+            | DnsRecord::NSEC { ttl, .. } => *ttl,
             DnsRecord::OPT { .. } => 0,
         }
     }
@@ -157,7 +217,11 @@ impl DnsRecord {
             | DnsRecord::SOA { domain, .. }
             | DnsRecord::SRV { domain, .. }
             | DnsRecord::PTR { domain, .. }
-            | DnsRecord::CAA { domain, .. } => domain,
+            | DnsRecord::CAA { domain, .. }
+            | DnsRecord::DNSKEY { domain, .. }
+            | DnsRecord::RRSIG { domain, .. }
+            | DnsRecord::DS { domain, .. }
+            | DnsRecord::NSEC { domain, .. } => domain,
             DnsRecord::OPT { .. } => "",
         }
     }
@@ -179,7 +243,11 @@ impl DnsRecord {
             | DnsRecord::SOA { domain: d, .. }
             | DnsRecord::SRV { domain: d, .. }
             | DnsRecord::PTR { domain: d, .. }
-            | DnsRecord::CAA { domain: d, .. } => *d = domain,
+            | DnsRecord::CAA { domain: d, .. }
+            | DnsRecord::DNSKEY { domain: d, .. }
+            | DnsRecord::RRSIG { domain: d, .. }
+            | DnsRecord::DS { domain: d, .. }
+            | DnsRecord::NSEC { domain: d, .. } => *d = domain,
             DnsRecord::OPT { .. } => {}
         }
         record

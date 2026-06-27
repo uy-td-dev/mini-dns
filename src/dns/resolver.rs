@@ -4,7 +4,7 @@
 //! chasing, AA/NXDOMAIN/NODATA determination and EDNS echo — kept separate from
 //! the wire (de)serialisation concerns in [`super::packet`].
 
-use crate::config::Zone;
+use crate::config::{AuthZone, Zone, ZoneSet};
 use crate::dns::header::DnsHeader;
 use crate::dns::packet::DnsPacket;
 use crate::dns::record::DnsRecord;
@@ -13,21 +13,28 @@ use crate::dns::record::DnsRecord;
 /// guarding against accidental or malicious CNAME loops.
 const MAX_CNAME_CHAIN: usize = 16;
 
-/// Builds a response packet for `request` against `zone`.
+/// Builds a response packet for `request` against `zones`.
 ///
 /// Resolution honours the question type, supports `*` wildcard records, and
 /// follows CNAME chains within the zone (appending each CNAME and the final
 /// target's records). The AA bit is set when the server is authoritative for
 /// the name, and NXDOMAIN is returned when the original name does not exist.
-pub fn build_response(request: &DnsPacket, zone: &Zone) -> DnsPacket {
+pub fn build_response(request: &DnsPacket, zones: &ZoneSet) -> DnsPacket {
     let mut answers = Vec::new();
+    let mut authorities = Vec::new();
     let mut authoritative = false;
     let mut rcode = 0u16; // NOERROR
+    // The last name looked up (tracked outside the question block so it is
+    // available for the negative-response SOA check below).
+    #[allow(unused_assignments)]
+    let mut name = String::new();
+    let mut matching_zone: Option<&AuthZone> = None;
 
     if let Some(question) = request.questions.first() {
         let qtype = question.qtype;
         // DNS names are case-insensitive, so match against a normalized key.
-        let mut name = question.qname.to_lowercase();
+        name = question.qname.to_lowercase();
+        matching_zone = zones.find(&name);
         let mut seen = std::collections::HashSet::new();
 
         for _ in 0..MAX_CNAME_CHAIN {
@@ -35,7 +42,23 @@ pub fn build_response(request: &DnsPacket, zone: &Zone) -> DnsPacket {
                 break; // CNAME loop detected
             }
 
-            let Some(records) = lookup(zone, &name) else {
+            // Look up the name within the authoritative zone for it. If no
+            // zone is authoritative, the name is unknown -> NXDOMAIN (and the
+            // caller may forward it if recursion is available).
+            let Some(zone) = zones.find(&name) else {
+                if answers.is_empty() {
+                    rcode = 3; // NXDOMAIN
+                }
+                break;
+            };
+            // Remember the zone for the negative-response SOA below. When
+            // chasing CNAMEs the zone may change as the target crosses into a
+            // different zone; we keep the zone of the *queried* name.
+            if matching_zone.is_none() {
+                matching_zone = Some(zone);
+            }
+
+            let Some(records) = lookup(&zone.records, &name) else {
                 // Original name missing -> NXDOMAIN; a dangling CNAME target
                 // simply ends the chain with what we have so far.
                 if answers.is_empty() {
@@ -71,6 +94,20 @@ pub fn build_response(request: &DnsPacket, zone: &Zone) -> DnsPacket {
         }
     }
 
+    // For negative responses (NXDOMAIN or NODATA), include the zone's SOA in
+    // the authority section so recursive resolvers can cache the negative
+    // answer (RFC 1035 §6.2.2, RFC 2308). The SOA comes from the zone
+    // authoritative for the queried name, if any. We also set AA here: even
+    // though the name doesn't exist, the server is authoritative for the
+    // zone it falls within.
+    if answers.is_empty()
+        && let Some(zone) = matching_zone
+        && let Some(soa) = zone_soa(&zone.records)
+    {
+        authorities.push(soa.clone());
+        authoritative = true;
+    }
+
     // QR=1 (response). Preserve the client's RD bit; RA stays 0 because this
     // server does not perform recursion.
     let mut flags = 0x8000 | (request.header.flags & 0x0100) | rcode;
@@ -95,30 +132,35 @@ pub fn build_response(request: &DnsPacket, zone: &Zone) -> DnsPacket {
             flags,
             questions: request.questions.len() as u16,
             answers: answers.len() as u16,
-            authorities: 0,
+            authorities: authorities.len() as u16,
             additionals: additionals.len() as u16,
         },
         questions: request.questions.clone(),
         answers,
-        authorities: Vec::new(),
+        authorities,
         additionals,
     }
 }
 
-/// Looks up a name in the zone, falling back to `*` wildcard records.
+/// Looks up a name in a zone's records, falling back to `*` wildcard records.
 ///
 /// An exact match wins; otherwise each parent suffix is tried as
 /// `*.<suffix>` from most to least specific (RFC 4592 style).
-fn lookup<'a>(zone: &'a Zone, name: &str) -> Option<&'a Vec<DnsRecord>> {
-    if let Some(records) = zone.get(name) {
-        return Some(records);
+fn lookup<'a>(records: &'a Zone, name: &str) -> Option<&'a Vec<DnsRecord>> {
+    if let Some(r) = records.get(name) {
+        return Some(r);
     }
     let mut remainder = name;
     while let Some(pos) = remainder.find('.') {
         remainder = &remainder[pos + 1..];
-        if let Some(records) = zone.get(&format!("*.{remainder}")) {
-            return Some(records);
+        if let Some(r) = records.get(&format!("*.{remainder}")) {
+            return Some(r);
         }
     }
     None
+}
+
+/// Finds the SOA record in a zone's records, if present.
+fn zone_soa(records: &Zone) -> Option<&DnsRecord> {
+    records.values().flatten().find(|r| matches!(r, DnsRecord::SOA { .. }))
 }

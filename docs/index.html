@@ -4,51 +4,425 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>mini-dns — Documentation</title>
-  <meta name="description" content="A lightweight DNS server in Rust — usage guide." />
+  <meta name="description" content="A lightweight, fast DNS server in Rust — authoritative zones, recursive forwarding & full recursive resolver, DoT/DoH/DoQ, DNSSEC, AXFR, blocklist, DNS64, Prometheus metrics." />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header class="hero">
     <div class="wrap">
       <h1>mini-dns</h1>
-      <p class="tagline">A lightweight DNS server in Rust — authoritative zones, recursive forwarding,
-        TTL caching, DoT/DoH, Prometheus metrics, and per-client rate limiting.</p>
+      <p class="tagline">A lightweight, fast DNS server in Rust. Authoritative zones, recursive forwarding
+        &amp; a full recursive resolver, encrypted transports (DoT / DoH / DoQ), DNSSEC, AXFR, a
+        domain blocklist, DNS64, Prometheus metrics, and per-client rate limiting.</p>
       <p class="links">
         <a class="btn" href="#quickstart">Quick start</a>
-        <a class="btn ghost" href="https://github.com/uy-td-dev/mini-dns">GitHub →</a>
+        <a class="btn ghost" href="https://github.com/uy-td-dev/mini-dns">GitHub &rarr;</a>
       </p>
     </div>
   </header>
 
   <div class="layout wrap">
-    <nav class="toc">
+    <nav class="toc" aria-label="Contents">
       <strong>Contents</strong>
       <ul>
         <li><a href="#features">Features</a></li>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#flow">Query flow</a></li>
+        <li><a href="#performance">Performance</a></li>
         <li><a href="#install">Install &amp; build</a></li>
         <li><a href="#quickstart">Quick start</a></li>
+        <li><a href="#docker">Docker</a></li>
         <li><a href="#zone">Zone file</a></li>
-        <li><a href="#config">Configuration</a></li>
+        <li><a href="#cli">CLI &amp; env config</a></li>
+        <li><a href="#config">TOML config</a></li>
         <li><a href="#recursion">Recursion &amp; caching</a></li>
-        <li><a href="#reload">Reloading the zone</a></li>
-        <li><a href="#encrypted">DoT / DoH</a></li>
-        <li><a href="#metrics">Metrics</a></li>
+        <li><a href="#conditional">Conditional forwarding</a></li>
+        <li><a href="#multi-zone">Multi-zone</a></li>
+        <li><a href="#blocklist">Blocklist (RPZ)</a></li>
+        <li><a href="#dns64">DNS64</a></li>
+        <li><a href="#axfr">AXFR zone transfer</a></li>
+        <li><a href="#dnssec">DNSSEC</a></li>
+        <li><a href="#encrypted">DoT / DoH / DoQ</a></li>
+        <li><a href="#ratelimit">Rate limiting</a></li>
+        <li><a href="#reload">Hot reload &amp; shutdown</a></li>
+        <li><a href="#metrics">Metrics &amp; health</a></li>
         <li><a href="#query">Querying</a></li>
       </ul>
     </nav>
 
     <main class="content">
+
       <section id="features">
         <h2>Features</h2>
         <ul>
           <li>Record types: <code>A</code>, <code>AAAA</code>, <code>CNAME</code>, <code>MX</code>,
             <code>TXT</code>, <code>NS</code>, <code>SOA</code>, <code>SRV</code>, <code>PTR</code>, <code>CAA</code></li>
-          <li>Wildcard records (<code>*.example.com</code>) and CNAME chaining</li>
-          <li>Case-insensitive lookups; correct <code>AA</code> / <code>NXDOMAIN</code> / <code>NODATA</code> handling</li>
-          <li><strong>EDNS(0)</strong>, UDP truncation (<code>TC</code>) with TCP fallback, name compression</li>
-          <li><strong>Recursive forwarding</strong> with a TTL cache (positive and negative/NXDOMAIN caching)</li>
-          <li><strong>Encrypted transports</strong>: DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH, HTTP/1.1 &amp; HTTP/2)</li>
-          <li><strong>Prometheus metrics</strong>, per-client rate limiting, and hot zone reload on <code>SIGHUP</code></li>
+          <li>Wildcard records (<code>*.example.com</code>) and CNAME chaining (resolved inline in one response)</li>
+          <li>Case-insensitive lookups; correct <code>AA</code> / <code>NXDOMAIN</code> / <code>NODATA</code>
+            handling with SOA in the authority section for negative caching (RFC&nbsp;2308)</li>
+          <li><strong>EDNS(0)</strong> &mdash; honours the client UDP payload size; UDP truncation
+            (<code>TC</code> bit) with TCP fallback; name compression on responses</li>
+          <li><strong>Recursive forwarding</strong> with a TTL cache (positive <em>and</em>
+            negative/NXDOMAIN caching), single-flight forwarding, and pooled upstream sockets</li>
+          <li><strong>Full recursive resolver</strong> mode &mdash; resolve iteratively from the root
+            servers (no dependency on 8.8.8.8/1.1.1.1), with delegation caching</li>
+          <li><strong>Conditional forwarding</strong> &mdash; route queries for specific domains to
+            different upstream resolvers (longest-suffix match)</li>
+          <li><strong>Multi-zone</strong> &mdash; serve as many authoritative zones as you like, with
+            correct per-zone SOA and <code>AA</code> handling (longest-suffix zone match)</li>
+          <li><strong>TOML config file</strong> &mdash; declarative config for zones, forwarding,
+            TLS, metrics, blocklist, DNS64, AXFR, and DNSSEC; CLI flags override file values</li>
+          <li><strong>Domain blocklist</strong> (RPZ-style) &mdash; block ads/malware domains with
+            wildcard support; hot-reloadable</li>
+          <li><strong>DNS64</strong> &mdash; synthesize <code>AAAA</code> from <code>A</code> records
+            using a configurable NAT64 prefix (RFC&nbsp;6147)</li>
+          <li><strong>AXFR zone transfer</strong> &mdash; with IP-based ACL (CIDR allowlist) for secondaries</li>
+          <li><strong>DNSSEC</strong> &mdash; DNSKEY/RRSIG/DS/NSEC parse + encode, ED25519 key generation
+            (RFC&nbsp;8080), and RRset signing with signature verification</li>
+          <li><strong>Encrypted transports</strong>: DNS-over-TLS (DoT), DNS-over-HTTPS (DoH over
+            HTTP/1.1 &amp; HTTP/2), and <strong>DNS-over-QUIC (DoQ, RFC&nbsp;9250)</strong></li>
+          <li><strong>Per-client rate limiting</strong> to mitigate floods/amplification</li>
+          <li><strong>Graceful shutdown</strong> on SIGTERM/Ctrl+C &mdash; drains in-flight queries
+            before exit; <code>/healthz</code> endpoint for load balancers</li>
+          <li><strong>Hot zone reload</strong> on <code>SIGHUP</code> (no restart needed)</li>
+          <li><strong>Prometheus metrics</strong> at <code>/metrics</code> (plain HTTP), plus
+            in-process metrics logged periodically</li>
+          <li>Configurable via CLI flags, environment variables, or TOML; structured logging via <code>tracing</code></li>
+        </ul>
+      </section>
+
+      <section id="architecture">
+        <h2>Architecture</h2>
+        <p>mini-dns is built around a single shared <code>ServerState</code> that every transport and
+          worker reads from. State is deliberately lock-free or sharded so that the hot path (answering
+          from the local zone or cache) never contends across cores.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 880 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mini-dns architecture overview">
+            <defs>
+              <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#9da7b3" />
+              </marker>
+              <style>
+                .box   { fill:#161b22; stroke:#30363d; stroke-width:1.5; rx:8; }
+                .lbl   { fill:#e6edf3; font:600 14px -apple-system, system-ui, sans-serif; }
+                .sub   { fill:#9da7b3; font:400 11px -apple-system, system-ui, sans-serif; }
+                .accent{ fill:#58a6ff; font:600 13px -apple-system, system-ui, sans-serif; }
+                .edge  { stroke:#9da7b3; stroke-width:1.5; fill:none; marker-end:url(#arrow); }
+              </style>
+            </defs>
+
+            <!-- Clients -->
+            <rect x="20" y="20" width="200" height="200" rx="8" class="box"/>
+            <text x="120" y="45" text-anchor="middle" class="accent">Clients</text>
+            <text x="120" y="72"  text-anchor="middle" class="lbl">dig / kdig / curl</text>
+            <text x="120" y="95"  text-anchor="middle" class="sub">UDP 53</text>
+            <text x="120" y="118" text-anchor="middle" class="sub">TCP 53</text>
+            <text x="120" y="141" text-anchor="middle" class="sub">DoT 853</text>
+            <text x="120" y="164" text-anchor="middle" class="sub">DoH 443</text>
+            <text x="120" y="187" text-anchor="middle" class="sub">DoQ 8853</text>
+
+            <!-- Listeners -->
+            <rect x="280" y="20" width="180" height="200" rx="8" class="box"/>
+            <text x="370" y="45" text-anchor="middle" class="accent">Transports</text>
+            <text x="370" y="72"  text-anchor="middle" class="lbl">UDP workers</text>
+            <text x="370" y="88"  text-anchor="middle" class="sub">(SO_REUSEPORT, one/core)</text>
+            <text x="370" y="118" text-anchor="middle" class="lbl">TCP / DoT / DoH / DoQ</text>
+            <text x="370" y="134" text-anchor="middle" class="sub">(TLS handshake → DNS stream)</text>
+            <text x="370" y="170" text-anchor="middle" class="lbl">Metrics HTTP</text>
+            <text x="370" y="186" text-anchor="middle" class="sub">/metrics  /healthz</text>
+
+            <!-- ServerState -->
+            <rect x="520" y="20" width="340" height="280" rx="8" class="box"/>
+            <text x="690" y="45" text-anchor="middle" class="accent">ServerState  (Arc, lock-free/sharded)</text>
+            <rect x="540" y="60"  width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="610" y="78"  text-anchor="middle" class="lbl">ZoneSet</text>
+            <text x="610" y="94"  text-anchor="middle" class="sub">ArcSwap — hot swap</text>
+            <rect x="700" y="60"  width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="770" y="78"  text-anchor="middle" class="lbl">Cache</text>
+            <text x="770" y="94"  text-anchor="middle" class="sub">DashMap + TTL</text>
+            <rect x="540" y="116" width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="610" y="134" text-anchor="middle" class="lbl">ForwardRules</text>
+            <text x="610" y="150" text-anchor="middle" class="sub">longest-suffix</text>
+            <rect x="700" y="116" width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="770" y="134" text-anchor="middle" class="lbl">MultiForwarder</text>
+            <text x="770" y="150" text-anchor="middle" class="sub">pool + semaphore</text>
+            <rect x="540" y="172" width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="610" y="190" text-anchor="middle" class="lbl">RecursiveResolver</text>
+            <text x="610" y="206" text-anchor="middle" class="sub">root → TLD → auth</text>
+            <rect x="700" y="172" width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="770" y="190" text-anchor="middle" class="lbl">RateLimiter</text>
+            <text x="770" y="206" text-anchor="middle" class="sub">per-IP window</text>
+            <rect x="540" y="228" width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="610" y="246" text-anchor="middle" class="lbl">Blocklist</text>
+            <text x="610" y="262" text-anchor="middle" class="sub">ArcSwap — RPZ</text>
+            <rect x="700" y="228" width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="770" y="246" text-anchor="middle" class="lbl">DNSSEC / DNS64</text>
+            <text x="770" y="262" text-anchor="middle" class="sub">sign + synthesize</text>
+
+            <!-- Upstream -->
+            <rect x="520" y="360" width="340" height="170" rx="8" class="box"/>
+            <text x="690" y="385" text-anchor="middle" class="accent">Upstream</text>
+            <rect x="540" y="400" width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="610" y="418" text-anchor="middle" class="lbl">Stub resolver</text>
+            <text x="610" y="434" text-anchor="middle" class="sub">1.1.1.1:53 / 8.8.8.8:53</text>
+            <rect x="700" y="400" width="140" height="44" rx="6" fill="#1b2230" stroke="#30363d"/>
+            <text x="770" y="418" text-anchor="middle" class="lbl">Root servers</text>
+            <text x="770" y="434" text-anchor="middle" class="sub">a–m.root-servers.net</text>
+            <text x="690" y="488" text-anchor="middle" class="sub">(conditional rules pick which one)</text>
+            <text x="690" y="506" text-anchor="middle" class="sub">TCP fallback when UDP truncated (TC bit)</text>
+
+            <!-- sidecar tasks -->
+            <rect x="20" y="360" width="460" height="170" rx="8" class="box"/>
+            <text x="250" y="385" text-anchor="middle" class="accent">Background tasks</text>
+            <text x="250" y="418" text-anchor="middle" class="lbl">SIGHUP → hot zone/blocklist reload</text>
+            <text x="250" y="442" text-anchor="middle" class="lbl">SIGTERM → graceful drain (≤ 5s)</text>
+            <text x="250" y="466" text-anchor="middle" class="lbl">Metrics reporter (60s log summary)</text>
+            <text x="250" y="490" text-anchor="middle" class="lbl">Rate-limiter cleanup (reclaim idle IPs)</text>
+
+            <!-- edges -->
+            <path d="M220 120 H 280" class="edge"/>
+            <path d="M460 120 H 520" class="edge"/>
+            <path d="M690 300 V 360" class="edge"/>
+            <path d="M690 360 V 300" class="edge"/>
+          </svg>
+          <figcaption>Figure 1 — Transports hand parsed queries to <code>ServerState</code>, which answers locally,
+            from cache, or forwards upstream. Sidecar tasks handle reload/shutdown/metrics.</figcaption>
+        </figure>
+
+        <h3>How it works</h3>
+        <p>Every transport (UDP, TCP, DoT, DoH, DoQ) parses raw bytes into a <code>DnsPacket</code> and
+          calls <code>ServerState::resolve</code> (or <code>resolve_local</code> for the UDP fast path).
+          The state holds <code>Arc</code> references to the zones, cache, forwarder, etc., so many workers
+          read concurrently without locking. Any mutation (zone reload, blocklist reload) uses
+          <code>ArcSwap::store</code> — an atomic pointer swap. In-flight queries keep their <code>Arc</code>
+          to the old snapshot (it isn't freed until the last reader finishes); new queries see the new
+          snapshot immediately.</p>
+
+        <h3>Why this design</h3>
+        <ul>
+          <li><strong>Arc + ArcSwap instead of Mutex</strong>: the zone and blocklist change very rarely
+            (only on SIGHUP) but are read on every query. A Mutex would become a bottleneck; ArcSwap makes
+            reads lock-free.</li>
+          <li><strong>DashMap instead of HashMap + RwLock</strong>: the cache and rate limiter are written
+            constantly (on every cache miss). DashMap shards by key hash, so cores hitting different keys
+            never contend on the same lock.</li>
+          <li><strong>Split <code>resolve_local</code> (sync) from <code>forward_ctx</code> (async)</strong>:
+            the fast path (zone/cache hit) runs inline on the recv worker — no task spawn, no allocation —
+            avoiding scheduler overhead when ~99% of queries are local. Only forwarding (which awaits the
+            network) spawns a task so the recv loop isn't blocked.</li>
+          <li><strong>One shared stream handler for TCP / DoT / DoH / DoQ</strong>: after the TLS handshake
+            all of them are just "a stream carrying length-prefixed DNS messages", so they share
+            <code>handle_dns_stream</code> and avoid duplicated code.</li>
+          <li><strong>Dedicated sidecar tasks</strong>: reload / signal / metrics live in background tasks
+            and never block the main recv loop — the server keeps answering queries while a new zone is
+            being loaded.</li>
+        </ul>
+      </section>
+
+      <section id="flow">
+        <h2>Query flow</h2>
+        <p>This is the exact order of steps from when a DNS query arrives to when a reply is sent.
+          Understanding this flow helps with debugging and configuring the server correctly.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 880 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="query resolution flowchart">
+            <defs>
+              <marker id="arr2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                <path d="M0,0 L0,6 L9,3 z" fill="#9da7b3" />
+              </marker>
+              <style>
+                .node  { fill:#161b22; stroke:#30363d; stroke-width:1.5; rx:8; }
+                .start { fill:#58a6ff; }
+                .end   { fill:#2ea043; }
+                .drop  { fill:#da3633; }
+                .dec   { fill:#1f6feb; }
+                .lbl2  { fill:#e6edf3; font:600 13px -apple-system, system-ui, sans-serif; }
+                .sub2  { fill:#9da7b3; font:400 11px -apple-system, system-ui, sans-serif; }
+                .e2    { stroke:#9da7b3; stroke-width:1.5; fill:none; marker-end:url(#arr2); }
+                .elbl  { fill:#9da7b3; font:italic 12px -apple-system, system-ui, sans-serif; }
+              </style>
+            </defs>
+
+            <!-- 1 receive -->
+            <rect x="330" y="20" width="220" height="48" rx="8" class="node start"/>
+            <text x="440" y="42" text-anchor="middle" class="lbl2">1. Receive query (UDP/TCP/DoT/DoH/DoQ)</text>
+
+            <!-- 2 rate limit -->
+            <rect x="330" y="92" width="220" height="56" rx="8" class="node"/>
+            <text x="440" y="113" text-anchor="middle" class="lbl2">2. Rate limit check</text>
+            <text x="440" y="132" text-anchor="middle" class="sub2">RateLimiter.allow(client_ip)</text>
+            <rect x="620" y="100" width="160" height="40" rx="8" class="node drop"/>
+            <text x="700" y="126" text-anchor="middle" class="lbl2">DROP (silent)</text>
+            <path d="M550 120 H 620" class="e2"/>
+            <text x="585" y="112" text-anchor="middle" class="elbl">over limit</text>
+            <path d="M440 148 V 168" class="e2"/>
+
+            <!-- 3 parse -->
+            <rect x="330" y="172" width="220" height="56" rx="8" class="node"/>
+            <text x="440" y="193" text-anchor="middle" class="lbl2">3. Parse → DnsPacket</text>
+            <text x="440" y="212" text-anchor="middle" class="sub2">from_bytes()</text>
+            <rect x="620" y="180" width="160" height="40" rx="8" class="node drop"/>
+            <text x="700" y="206" text-anchor="middle" class="lbl2">DROP + log</text>
+            <path d="M550 200 H 620" class="e2"/>
+            <text x="585" y="192" text-anchor="middle" class="elbl">malformed</text>
+            <path d="M440 228 V 248" class="e2"/>
+
+            <!-- 4 blocklist -->
+            <rect x="330" y="252" width="220" height="56" rx="8" class="node"/>
+            <text x="440" y="273" text-anchor="middle" class="lbl2">4. Blocklist check</text>
+            <text x="440" y="292" text-anchor="middle" class="sub2">exact / wildcard match</text>
+            <rect x="60" y="260" width="180" height="40" rx="8" class="node drop"/>
+            <text x="150" y="286" text-anchor="middle" class="lbl2">NXDOMAIN (synth)</text>
+            <path d="M330 280 H 240" class="e2"/>
+            <text x="285" y="272" text-anchor="middle" class="elbl">blocked</text>
+            <path d="M440 308 V 328" class="e2"/>
+
+            <!-- 5 zone lookup -->
+            <rect x="330" y="332" width="220" height="56" rx="8" class="node dec"/>
+            <text x="440" y="353" text-anchor="middle" class="lbl2">5. Zone lookup</text>
+            <text x="440" y="372" text-anchor="middle" class="sub2">ZoneSet.find() — longest-suffix</text>
+            <path d="M440 388 V 408" class="e2"/>
+
+            <!-- 6 found? -->
+            <rect x="120" y="412" width="220" height="56" rx="8" class="node"/>
+            <text x="230" y="433" text-anchor="middle" class="lbl2">6a. Authoritative answer</text>
+            <text x="230" y="452" text-anchor="middle" class="sub2">CNAME chase + AA bit + SOA on miss</text>
+            <rect x="330" y="412" width="220" height="56" rx="8" class="node dec"/>
+            <text x="440" y="433" text-anchor="middle" class="lbl2">6b. Name not local?</text>
+            <text x="440" y="452" text-anchor="middle" class="sub2">RD set + recursion available?</text>
+            <path d="M330 440 H 340" class="e2"/>
+            <text x="335" y="432" text-anchor="middle" class="elbl">hit</text>
+
+            <path d="M440 468 V 488" class="e2"/>
+            <text x="455" y="482" class="elbl">miss</text>
+
+            <!-- 7 cache -->
+            <rect x="330" y="492" width="220" height="56" rx="8" class="node"/>
+            <text x="440" y="513" text-anchor="middle" class="lbl2">7. Cache lookup (name, qtype)</text>
+            <text x="440" y="532" text-anchor="middle" class="sub2">DashMap + TTL</text>
+            <rect x="60" y="500" width="180" height="40" rx="8" class="node end"/>
+            <text x="150" y="526" text-anchor="middle" class="lbl2">CACHE HIT → reply</text>
+            <path d="M330 520 H 240" class="e2"/>
+            <text x="285" y="512" text-anchor="middle" class="elbl">hit</text>
+            <path d="M440 548 V 568" class="e2"/>
+
+            <!-- 8 forward decision -->
+            <rect x="330" y="572" width="220" height="56" rx="8" class="node dec"/>
+            <text x="440" y="593" text-anchor="middle" class="lbl2">8. Forward rule match?</text>
+            <text x="440" y="612" text-anchor="middle" class="sub2">ForwardRules.match_name()</text>
+            <path d="M440 628 V 648" class="e2"/>
+            <text x="455" y="642" class="elbl">no match</text>
+
+            <!-- 9 single-flight forward/recursive -->
+            <rect x="330" y="652" width="220" height="64" rx="8" class="node"/>
+            <text x="440" y="675" text-anchor="middle" class="lbl2">9. Forward or recurse</text>
+            <text x="440" y="692" text-anchor="middle" class="sub2">single-flight + socket pool</text>
+            <text x="440" y="707" text-anchor="middle" class="sub2">recursive: root → TLD → auth</text>
+            <rect x="60" y="660" width="180" height="48" rx="8" class="node end"/>
+            <text x="150" y="680" text-anchor="middle" class="lbl2">CACHE + REPLY</text>
+            <text x="150" y="696" text-anchor="middle" class="sub2">patch txn ID</text>
+            <path d="M330 684 H 240" class="e2"/>
+            <text x="285" y="676" text-anchor="middle" class="elbl">done</text>
+
+            <rect x="620" y="572" width="180" height="56" rx="8" class="node"/>
+            <text x="710" y="593" text-anchor="middle" class="lbl2">→ specific upstream</text>
+            <text x="710" y="612" text-anchor="middle" class="sub2">conditional rule</text>
+            <path d="M550 600 H 620" class="e2"/>
+            <text x="585" y="592" text-anchor="middle" class="elbl">match</text>
+            <path d="M710 628 V 672 H 550" class="e2"/>
+          </svg>
+          <figcaption>Figure 2 — Single query resolution path. Green = reply to client; red = drop/refuse;
+            blue diamond = decision. The fast path (zone hit or cache hit) never spawns a task.</figcaption>
+        </figure>
+
+        <h3>Step-by-step &amp; rationale</h3>
+        <ol class="flow-list">
+          <li><strong>Receive query</strong> — the UDP recv loop uses <code>SO_REUSEPORT</code> (one socket
+            per core) so the kernel spreads packets across cores via a hash, instead of a single recv loop
+            becoming a bottleneck.</li>
+          <li><strong>Rate limit</strong> — checked <em>before</em> parsing to reject amplification-flood
+            traffic at the door. Drops are silent (no reply) so the server spends no bandwidth on the
+            attacker. Fixed-window + DashMap is used because it's O(1) and needs no sorted structure.</li>
+          <li><strong>Parse</strong> — <code>DnsPacket::from_bytes</code> parses the header, questions and
+            EDNS OPT. On failure we drop + log a warning rather than send SERVFAIL for garbage, so junk
+            can't be turned into a reflection vector.</li>
+          <li><strong>Blocklist</strong> — checked here (after parse, before zone lookup) so blocked names
+            are blocked <em>before</em> forwarding or a zone could answer. A synthesized NXDOMAIN is returned
+            because clients cache negative answers and stop retrying immediately, reducing recurring load
+            for ad/tracker domains.</li>
+          <li><strong>Zone lookup</strong> — <code>ZoneSet::find</code> picks the longest-suffix-matching
+            zone (e.g. <code>corp.example.com</code> wins over <code>example.com</code>). Zones are sorted
+            by origin length descending at load time, so first-match = longest-match.</li>
+          <li><strong>Authoritative answer</strong> — records are looked up in the zone, with CNAME chase
+            confined to the same zone (to guarantee termination). If the name lives in the zone but has no
+            record of the requested type (NODATA), the SOA is included in the authority section so the
+            client can negative-cache per RFC 2308.</li>
+          <li><strong>Cache lookup</strong> — reached only when the name is <em>not</em> in any local zone,
+            the client set <code>RD</code> (Recursion Desired), and the server offers recursion. The cache
+            stores both positive answers and NXDOMAIN; TTL is the min answer TTL, or the SOA minimum (capped
+            at 3600s) for negative answers.</li>
+          <li><strong>Forward rule match</strong> — <code>ForwardRules::match_name</code> does longest-suffix
+            matching to route <code>*.corp.example.com</code> to an internal resolver while the rest goes
+            to the default upstream or the recursive resolver. This enables "split-horizon DNS" from a single
+            server.</li>
+          <li><strong>Forward or recurse</strong> —
+            <em>Forward</em>: <code>MultiForwarder</code> lazily creates one <code>Forwarder</code> per
+            upstream, each with a pool of connected UDP sockets + a semaphore bounding concurrency (default
+            64) so upstreams aren't flooded. If a UDP reply has the <code>TC</code> (truncated) bit, it
+            automatically retries over TCP. <br/>
+            <em>Recurse</em>: <code>RecursiveResolver</code> walks from the root hints, caching
+            delegations per-TLD so subsequent queries under <code>.com</code> don't re-hit the root, with
+            QNAME minimization (RFC 9156).
+            <br/>Both paths go through <strong>single-flight</strong>: many concurrent identical queries
+            share one leader's upstream call; followers reuse the result, avoiding a "thundering herd" when
+            a cache entry expires.</li>
+        </ol>
+      </section>
+
+      <section id="performance">
+        <h2>Performance</h2>
+        <ul>
+          <li><strong><code>SO_REUSEPORT</code></strong> &mdash; one UDP socket per core so the kernel
+            load-balances ingress across cores instead of funnelling through a single receive loop</li>
+          <li><strong>Fast path</strong> &mdash; local and cached answers are resolved synchronously and
+            sent inline: no task spawn or per-packet allocation; only forwarded queries spawn a task</li>
+          <li><strong>Thread-per-core</strong> &mdash; runtime workers are pinned to CPU cores
+            (best-effort), one per core</li>
+          <li><strong>Lock-free / sharded state</strong> &mdash; zone via <code>arc-swap</code>, cache and
+            rate limiter via <code>DashMap</code>, metrics sharded and cache-line padded</li>
+          <li><strong>Single-flight forwarding</strong> &mdash; concurrent identical cache misses
+            collapse into one upstream query; upstream sockets are pooled and bounded by a semaphore</li>
+        </ul>
+        <blockquote>Not yet implemented: <code>io_uring</code> + <code>recvmmsg</code> batching and a
+          thread-per-core runtime such as <code>monoio</code> &mdash; these are Linux-only and would
+          replace the Tokio runtime; left as future work.</blockquote>
+
+        <h3>Why this design</h3>
+        <ul>
+          <li><strong><code>SO_REUSEPORT</code></strong>: one UDP socket per core; the kernel hashes
+            <code>(src IP, port)</code> to spread packets onto a fixed socket/core. No single "hot" recv
+            loop becomes a bottleneck, and multiple NIC queues can be used. We bind N sockets (with
+            REUSEPORT) instead of one because <code>UdpSocket::recv_from</code> can't run concurrent
+            <code>recvmmsg</code> on a single socket.</li>
+          <li><strong>Fast path inline</strong>: <code>resolve_local</code> runs synchronously on the
+            worker thread without spawning a Tokio task. A zone/cache hit simply builds the response and
+            calls <code>socket.send_to</code> right inside the recv context — zero scheduler overhead,
+            zero allocation beyond <code>&amp;mut buf</code>. Only forwarding (which awaits the network)
+            does <code>tokio::spawn</code> so the recv loop stays unblocked.</li>
+          <li><strong>Thread-per-core + pinning</strong>: <code>core_affinity::set_for_current</code> pins
+            each worker thread to a specific CPU, avoiding core migration that would thrash caches.
+            Best-effort because the OS may refuse to honour the affinity.</li>
+          <li><strong>Lock-free / sharded</strong>: the zone and blocklist are behind <code>ArcSwap</code> —
+            a read is just an atomic pointer load, no lock. The cache, rate limiter and inflight map use
+            <code>DashMap</code> sharded by key hash, so cores touching different keys never contend.
+            Metrics are sharded and cache-line padded so false-sharing doesn't turn the counters into a
+            serialization point.</li>
+          <li><strong>Single-flight</strong>: N queries with the same <code>(name, qtype)</code> cache miss
+            collapse onto one leader that calls the upstream; the N-1 followers wait on a
+            <code>watch::channel</code>. This avoids thundering herds when 1000 clients all query the same
+            name just as a cache entry expires. <code>InflightGuard::drop</code> always removes the entry
+            even if the leader task is cancelled, so the DashMap can't leak.</li>
         </ul>
       </section>
 
@@ -65,10 +439,23 @@ cargo build --release</code></pre>
 
       <section id="quickstart">
         <h2>Quick start</h2>
-        <p>Run with defaults — listens on <code>127.0.0.1:8888</code> (UDP and TCP):</p>
+        <p>Run with defaults &mdash; listens on <code>127.0.0.1:8888</code> (UDP and TCP):</p>
         <pre><code>./target/release/mini-dns</code></pre>
         <p>Query it with <code>dig</code>:</p>
         <pre><code>dig @127.0.0.1 -p 8888 example.com A</code></pre>
+      </section>
+
+      <section id="docker">
+        <h2>Docker</h2>
+        <p>An image and <code>docker-compose.yml</code> are provided. The container exposes UDP/TCP 53
+          by default and mounts your config and zones:</p>
+        <pre><code>docker compose up --build</code></pre>
+        <p>Or build and run manually, passing a TOML config:</p>
+        <pre><code>docker build -t mini-dns .
+docker run --rm -p 53:53/udp -p 53:53 \
+  -v $(pwd)/config.toml:/etc/mini-dns/config.toml \
+  -v $(pwd)/zones:/zones \
+  mini-dns --config /etc/mini-dns/config.toml</code></pre>
       </section>
 
       <section id="zone">
@@ -85,65 +472,414 @@ www.example.com. 3600 CNAME example.com.
 example.com.     3600 MX    10 mail.example.com.
 example.com.     3600 TXT   "v=spf1 -all"
 *.example.com.   3600 A     192.0.2.9</code></pre>
-        <p>Blank lines and lines starting with <code>;</code> are ignored. A malformed line is logged with its
-          line number and skipped, so one bad entry won't stop the rest of the zone from loading.</p>
+        <p>Blank lines and lines starting with <code>;</code> are ignored. A malformed line is logged
+          with its line number and skipped, so one bad entry won't stop the rest of the zone from loading.</p>
       </section>
 
-      <section id="config">
-        <h2>Configuration</h2>
-        <p>Settings come from CLI flags or environment variables — <strong>flags take precedence</strong>.</p>
+      <section id="cli">
+        <h2>CLI &amp; env config</h2>
+        <p>Settings come from CLI flags or environment variables &mdash; <strong>flags take precedence</strong>.
+          When a TOML config is also given, CLI flags override the file's values for the same setting.</p>
         <div class="table-scroll">
         <table>
           <thead><tr><th>Flag</th><th>Env var</th><th>Description</th><th>Default</th></tr></thead>
           <tbody>
-            <tr><td><code>-z</code>, <code>--zone</code></td><td><code>MINI_DNS_ZONE</code></td><td>Path to the zone file</td><td><code>zones/example.zone</code></td></tr>
+            <tr><td><code>--config</code></td><td><code>MINI_DNS_CONFIG</code></td><td>Path to a TOML config file</td><td>disabled</td></tr>
+            <tr><td><code>-z</code>, <code>--zone</code></td><td><code>MINI_DNS_ZONE</code></td><td>Path to the zone file (single-zone mode; ignored with <code>--config</code>)</td><td><code>zones/example.zone</code></td></tr>
             <tr><td><code>-a</code>, <code>--addr</code></td><td><code>MINI_DNS_ADDR</code></td><td>Address to bind (UDP + TCP)</td><td><code>127.0.0.1:8888</code></td></tr>
             <tr><td><code>-u</code>, <code>--upstream</code></td><td><code>MINI_DNS_UPSTREAM</code></td><td>Upstream resolver for recursion (<code>host:port</code>)</td><td><code>8.8.8.8:53</code></td></tr>
-            <tr><td><code>--no-recurse</code></td><td>—</td><td>Disable forwarding; serve only the local zone</td><td>off</td></tr>
+            <tr><td><code>--no-recurse</code></td><td>&mdash;</td><td>Disable forwarding; serve only the local zone</td><td>off</td></tr>
             <tr><td><code>--rate-limit</code></td><td><code>MINI_DNS_RATE_LIMIT</code></td><td>Max queries/client/sec (<code>0</code> = unlimited)</td><td><code>0</code></td></tr>
-            <tr><td><code>--cache-size</code></td><td>—</td><td>Max cached forwarded answers</td><td><code>1024</code></td></tr>
+            <tr><td><code>--cache-size</code></td><td>&mdash;</td><td>Max cached forwarded answers</td><td><code>1024</code></td></tr>
             <tr><td><code>--dot-addr</code></td><td><code>MINI_DNS_DOT_ADDR</code></td><td>Enable DNS-over-TLS on this address</td><td>disabled</td></tr>
             <tr><td><code>--doh-addr</code></td><td><code>MINI_DNS_DOH_ADDR</code></td><td>Enable DNS-over-HTTPS on this address</td><td>disabled</td></tr>
+            <tr><td><code>--doq-addr</code></td><td><code>MINI_DNS_DOQ_ADDR</code></td><td>Enable DNS-over-QUIC on this address</td><td>disabled</td></tr>
             <tr><td><code>--tls-cert</code></td><td><code>MINI_DNS_TLS_CERT</code></td><td>TLS certificate (PEM)</td><td>self-signed</td></tr>
             <tr><td><code>--tls-key</code></td><td><code>MINI_DNS_TLS_KEY</code></td><td>TLS private key (PEM)</td><td>self-signed</td></tr>
             <tr><td><code>--metrics-addr</code></td><td><code>MINI_DNS_METRICS_ADDR</code></td><td>Expose Prometheus <code>/metrics</code> (plain HTTP)</td><td>disabled</td></tr>
-            <tr><td><code>-v</code>, <code>--verbose</code></td><td>—</td><td>Increase log verbosity (<code>-v</code>, <code>-vv</code>)</td><td>INFO level</td></tr>
+            <tr><td><code>-v</code>, <code>--verbose</code></td><td>&mdash;</td><td>Increase log verbosity (<code>-v</code>, <code>-vv</code>)</td><td>INFO level</td></tr>
           </tbody>
         </table>
         </div>
-        <p>Log level can also be set via the <code>RUST_LOG</code> environment variable. Example — serve a custom
-          zone on port 5353, forward to Cloudflare, and rate-limit to 50 q/s per client:</p>
+        <p>Log level can also be set via the <code>RUST_LOG</code> environment variable. Example &mdash;
+          serve a custom zone on port 5353, forward to Cloudflare, and rate-limit to 50 q/s per client:</p>
         <pre><code>./target/release/mini-dns --zone /etc/mini-dns/db.zone --addr 0.0.0.0:5353 \
     --upstream 1.1.1.1:53 --rate-limit 50 -v</code></pre>
       </section>
 
-      <section id="recursion">
-        <h2>Recursion &amp; caching</h2>
-        <p>By default, names not found in the zone are forwarded to the upstream resolver and answers are cached
-          for their TTL. Use <code>--no-recurse</code> to run as a pure authoritative server (returning
-          <code>NXDOMAIN</code> for unknown names).</p>
+      <section id="config">
+        <h2>TOML config file</h2>
+        <p>For deployments with multiple zones, conditional forwarding rules, encrypted transports, or
+          the extra features (blocklist / DNS64 / AXFR / DNSSEC), a TOML config file is easier than a long
+          CLI invocation. A sample is at <code>config.sample.toml</code>:</p>
+        <pre><code>./target/release/mini-dns --config /etc/mini-dns/config.toml</code></pre>
+        <pre><code>[server]
+addr = "0.0.0.0:53"
+rate_limit = 50
+# cache_size = 1024
+# no_recurse = false
+
+[upstream]
+default = "1.1.1.1:53"
+timeout_secs = 5
+# recursive = true   # full recursive resolver (resolve from root)
+
+# Conditional forwarding: *.corp.example.com -> internal resolver
+[[upstream.rules]]
+suffix = "corp.example.com"
+upstream = "10.0.0.53:53"
+
+[[zone]]
+origin = "example.com"
+file = "zones/example.zone"
+
+[[zone]]
+origin = "internal"
+file = "zones/internal.zone"
+
+[tls]
+dot_addr = "0.0.0.0:853"
+doh_addr = "0.0.0.0:443"
+# doq_addr = "0.0.0.0:853"   # DNS-over-QUIC (RFC 9250)
+# cert = "/etc/mini-dns/cert.pem"
+# key  = "/etc/mini-dns/key.pem"
+
+[metrics]
+addr = "0.0.0.0:9153"
+
+[blocklist]
+file = "zones/blocklist.txt"
+
+[dns64]
+prefix = "64:ff9b::"
+
+[axfr]
+allow = ["10.0.0.0/8", "192.168.1.5"]
+
+[dnssec]
+enabled = true</code></pre>
+        <p>CLI flags override config-file values when both are set, so you can keep the config as
+          defaults and tweak one setting from the command line.</p>
       </section>
 
-      <section id="reload">
-        <h2>Reloading the zone</h2>
-        <p>Send <code>SIGHUP</code> to reload the zone file in place, without dropping in-flight queries or restarting:</p>
-        <pre><code>kill -HUP $(pgrep mini-dns)</code></pre>
+      <section id="recursion">
+        <h2>Recursion &amp; caching</h2>
+        <p>By default, names not found in any local zone are forwarded to the upstream resolver and the
+          answers are cached for their TTL. Both positive and negative (<code>NXDOMAIN</code>) answers are
+          cached. Use <code>--no-recurse</code> to run as a pure authoritative server (returning
+          <code>NXDOMAIN</code> for unknown names).</p>
+        <p>For a <strong>full recursive resolver</strong> (resolve iteratively from the root servers, no
+          dependency on 8.8.8.8/1.1.1.1), set <code>recursive = true</code> under <code>[upstream]</code> in
+          the config. Conditional forwarding rules still apply &mdash; matched names go to their specific
+          upstream instead of being resolved iteratively.</p>
+
+        <h3>How it works</h3>
+        <p><strong>Stub forwarding</strong> (<code>[upstream].default</code>): the query bytes are sent
+          verbatim to the upstream through a pool of already-<code>connect()</code>ed UDP sockets. On
+          <code>recv</code> the transaction ID is matched so stale datagrams from a previous query are
+          ignored (sockets are reused). If the upstream sets the <code>TC</code> bit, the forwarder opens a
+          TCP connection, re-sends the query, and returns the full response — the client never sees
+          truncation when the upstream actually has the data.</p>
+        <p><strong>Full recursive</strong> (<code>recursive = true</code>): instead of asking one upstream,
+          the server walks the delegation chain itself.</p>
+        <ol>
+          <li>Start from the 13 root hints (<code>a.root-servers.net</code> … <code>m.root-servers.net</code>).</li>
+          <li>Send the query (or just the minimal suffix for QNAME minimization, RFC 9156) to a root server.</li>
+          <li>The root returns a <em>delegation</em>: NS records for the TLD + glue A/AAAA. The delegation is
+            cached keyed by the TLD suffix with its original TTL, so the next query under <code>.com</code>
+            doesn't re-hit the root.</li>
+          <li>Follow the delegation to the TLD server, then to the authoritative server, until an answer or
+            <code>NXDOMAIN</code> is received.</li>
+          <li>Depth is bounded by <code>MAX_DELEGATION_DEPTH = 20</code> (RFC 1034) to prevent infinite loops.</li>
+        </ol>
+        <p>Final answers are cached just like forwarded ones (same <code>Cache</code>), so a repeated query
+          doesn't trigger a fresh resolution.</p>
+        <p><strong>Why support both modes?</strong> Stub forwarding is simple, fast and creates little root
+          traffic — suitable for most cases. Recursive mode makes the server independent — it still works
+          when 8.8.8.8/1.1.1.1 are down or filtered, and it prevents upstream resolvers from profiling the
+          user's DNS activity. Trade-off: recursion costs an extra round-trip per delegation step, but
+          delegation caching makes it much cheaper on the second call.</p>
+      </section>
+
+      <section id="conditional">
+        <h2>Conditional forwarding</h2>
+        <p>Route queries for specific domains to different upstream resolvers using
+          <code>[[upstream.rules]]</code>. The longest matching suffix wins, so
+          <code>corp.example.com</code> matches before <code>example.com</code>:</p>
+        <pre><code>[[upstream.rules]]
+suffix = "corp.example.com"
+upstream = "10.0.0.53:53"
+
+[[upstream.rules]]
+suffix = "internal"
+upstream = "10.0.0.53:53"</code></pre>
+        <p>Unmatched names fall through to the default upstream (or to the recursive resolver if
+          <code>recursive = true</code>).</p>
+
+        <h3>How it works</h3>
+        <p>At load time the rules are sorted by <code>suffix.len()</code> descending. For each query that
+          misses the zone, <code>match_name</code> iterates the sorted rule list; the first rule whose
+          suffix is <em>equal to</em> the name or for which the name <em>ends with</em> <code>.suffix</code>
+          wins. If no rule matches, the default upstream (if any) or the recursive resolver is used.</p>
+        <p><strong>Why longest-suffix?</strong> So a more specific rule beats a general one. For example
+          <code>corp.example.com &rarr; internal resolver</code> is not overridden by
+          <code>example.com &rarr; public</code>. This also matches how DNS delegation splits zones — the
+          more specific (child) zone is always authoritative before the parent.</p>
+        <p><strong>Why not regex?</strong> Regexes are more powerful but more expensive O(n) per match and
+          need a parser. Longest-suffix is a simple O(n) that's enough for ~99% of use cases
+          (split-horizon, route-internal-only, per-TLD routing) and gives predictable performance.</p>
+      </section>
+
+      <section id="multi-zone">
+        <h2>Multi-zone</h2>
+        <p>Declare as many authoritative zones as you like with multiple <code>[[zone]]</code> blocks.
+          Zones are matched by longest suffix, so a query for <code>www.corp.example.com</code> matches the
+          <code>corp.example.com</code> zone before the <code>example.com</code> zone. Each zone carries
+          its own SOA and authoritative (<code>AA</code>) handling.</p>
+        <pre><code>[[zone]]
+origin = "example.com"
+file = "zones/example.zone"
+
+[[zone]]
+origin = "internal"
+file = "zones/internal.zone"</code></pre>
+
+        <h3>How it works</h3>
+        <p>All zone files are loaded into a <code>Vec&lt;AuthZone&gt;</code> and sorted by
+          <code>origin.len()</code> descending. For each query, <code>ZoneSet::find(name)</code> iterates
+          until the first zone whose origin is <em>equal to</em> the name or whose origin the name
+          <em>ends with</em> as <code>.origin</code> wins. The matching zone sets the <code>AA</code> bit
+          and carries its own SOA (so negative caching is correct).</p>
+        <p><strong>Why sort once at load instead of a BST?</strong> The number of zones is usually small
+          (tens); a one-time O(n log n) sort plus O(n) linear lookup with branch-friendly string compares
+          beats the complexity and allocations of a BST at this scale.</p>
+        <p><strong>Why does the per-zone SOA matter?</strong> When returning <code>NXDOMAIN</code> /
+          <code>NODATA</code>, the authority section must carry the SOA of the <em>matching</em> zone so the
+          client caches the negative answer with that zone's TTL. Using a single global SOA would give
+          wrong negative TTLs and could block clients from unrelated TLDs.</p>
+      </section>
+
+      <section id="blocklist">
+        <h2>Blocklist (RPZ-style)</h2>
+        <p>Block ads/malware domains by listing them in a file &mdash; one per line, with
+          <code>;</code> or <code>#</code> for comments and <code>*.</code> wildcard support. Blocked
+          queries receive a synthesized <code>NXDOMAIN</code>. The blocklist is hot-reloadable.</p>
+        <pre><code>[blocklist]
+file = "zones/blocklist.txt"</code></pre>
+        <pre><code># zones/blocklist.txt
+ads.example.net
+*.malware.example.org   # wildcard block
+# tracker.foo.         # commented out</code></pre>
+
+        <h3>How it works</h3>
+        <p>The blocklist is loaded into a lowercased <code>HashSet&lt;String&gt;</code> held behind an
+          <code>ArcSwap</code>. For each query: lowercase the qname, check the exact name in the set, then
+          walk each parent suffix to match wildcards like <code>*.example.com</code><sup>1</sup>. On a hit,
+          a synthesized <code>NXDOMAIN</code> is returned immediately on the fast path — no forwarding, no
+          zone lookup.</p>
+        <p><strong>Why NXDOMAIN instead of REFUSED or 0.0.0.0?</strong> Clients cache NXDOMAIN with its
+          negative TTL, so they don't keep retrying — reducing recurring server load. REFUSED may be
+          retried immediately. <code>0.0.0.0</code> looks like a valid IP to apps, which then try to connect
+          and fail confusingly. NXDOMAIN ("does not exist") is the cleanest semantic for a block.</p>
+        <p><sup>1</sup> The wildcard <code>*.example.com</code> blocks <code>sub.example.com</code> but
+          does <em>not</em> block <code>example.com</code> itself (per standard DNS wildcard semantics).</p>
+      </section>
+
+      <section id="dns64">
+        <h2>DNS64</h2>
+        <p>When an <code>AAAA</code> query has no native <code>AAAA</code> record but the name has
+          <code>A</code> records, mini-dns synthesizes an <code>AAAA</code> by embedding the IPv4 address in
+          a NAT64 prefix (RFC&nbsp;6147). The default well-known prefix is
+          <code>64:ff9b::/96</code>:</p>
+        <pre><code>[dns64]
+prefix = "64:ff9b::"</code></pre>
+
+        <h3>How it works</h3>
+        <p>Synthesis only triggers for AAAA queries <em>and</em> when the zone has no native AAAA for the
+          name (so real AAAA records are never overwritten). The A records for the same name are read; for
+          each A, the 4 IPv4 bytes are placed into the last 4 bytes of the prefix to build a synthetic
+          AAAA. The TTL equals the A record's TTL, and the final response sets <code>AA</code> since the
+          server is authoritative for the zone.</p>
+        <p><strong>Why is this needed?</strong> IPv6-only networks (e.g. mobile carriers, IoT) can't
+          connect directly to IPv4. A NAT64 gateway needs an AAAA to know where to route; DNS64 produces
+          a synthetic AAAA pointing into the NAT64 prefix, and the gateway translates the packets back to
+          the real IPv4. The whole process is automatic — clients don't need to change anything.</p>
+      </section>
+
+      <section id="axfr">
+        <h2>AXFR zone transfer</h2>
+        <p>Allow secondary servers to transfer a zone over TCP with an IP-based ACL. Empty or omitted
+          <code>allow</code> denies all transfers. Both single IPs and CIDR ranges are accepted:</p>
+        <pre><code>[axfr]
+allow = ["10.0.0.0/8", "192.168.1.5"]</code></pre>
+        <pre><code># pull a zone from an allowed secondary
+dig @ns1.example.com example.com AXFR</code></pre>
+
+        <h3>How it works</h3>
+        <p>AXFR is only valid over TCP (RFC 5936). When an <code>AXFR</code> query arrives on a stream
+          transport, <code>try_axfr</code> runs <em>before</em> the normal resolution path:</p>
+        <ol>
+          <li>Check the client IP against <code>Acl::is_allowed</code> (CIDR match). On failure, return
+            <code>REFUSED</code> (rcode 5) without leaking any zone data.</li>
+          <li>Find the zone matching the qname. If none, return <code>NXDOMAIN</code>.</li>
+          <li>Frame the response: SOA (opening the transfer) &rarr; every other record (sorted by owner
+            name for deterministic output) &rarr; SOA again (closing the transfer).</li>
+        </ol>
+        <p><strong>Why ACL before zone check?</strong> To avoid leaking which zones exist to unauthorized
+          clients. Like the blocklist, the ACL parses CIDRs once at startup (not per query), so lookups are
+          O(1).</p>
+      </section>
+
+      <section id="dnssec">
+        <h2>DNSSEC</h2>
+        <p>Enable DNSSEC signing to publish <code>DNSKEY</code> records at zone apexes and sign answer
+          RRsets with <code>RRSIG</code>. mini-dns supports DNSKEY/RRSIG/DS/NSEC record types (parse +
+          encode), ED25519 key generation (RFC&nbsp;8080), and RRset signing with signature verification.</p>
+        <pre><code>[dnssec]
+enabled = true</code></pre>
+
+        <h3>How it works</h3>
+        <p>At startup an ED25519 keypair is generated and a DNSKEY record is attached to each zone's apex.
+          For each query (unless the client set <code>DO=0</code> in EDNS):</p>
+        <ol>
+          <li>If it's a <code>DNSKEY</code> query at an apex, the DNSKEY records are injected into the
+            answer, together with an RRSIG over the DNSKEY RRset itself.</li>
+          <li>For any query with answer records, the records are grouped by <code>(owner, type)</code>
+            into RRsets; each RRset is signed with ED25519 and the resulting <code>RRSIG</code> is appended
+            to the answer.</li>
+          <li>Inception = now, expiration = now + 30 days, <code>original_ttl</code> = the RRset's minimum
+            TTL (so a validator can compute the canonical form).</li>
+        </ol>
+        <p><strong>Why ED25519?</strong> Signing is much faster than RSA-2048 (μs vs ms), signatures are
+          tiny (64 bytes vs 256), and it's a standard (RFC 8080). Trade-off: not every resolver can verify
+          ED25519, but most modern ones (Unbound, BIND 9.11+, Knot) do.</p>
+        <p><strong>Current limitation</strong>: only signing is implemented — NSEC / NSEC3 for
+          denial-of-existence isn't generated, so negative answers carry no signature. This will be added
+          in a later release.</p>
       </section>
 
       <section id="encrypted">
-        <h2>Encrypted transports (DoT / DoH)</h2>
-        <p>Enable DNS-over-TLS and/or DNS-over-HTTPS by giving them an address. If no certificate is provided, a
-          self-signed certificate for <code>localhost</code> is generated at startup (local testing only):</p>
-        <pre><code>./target/release/mini-dns --dot-addr 127.0.0.1:8853 --doh-addr 127.0.0.1:8443</code></pre>
-        <p>DoH exposes <code>/dns-query</code> (RFC 8484) over HTTP/1.1 and HTTP/2, accepting <code>POST</code> with
-          an <code>application/dns-message</code> body or <code>GET ?dns=&lt;base64url&gt;</code>.</p>
+        <h2>Encrypted transports (DoT / DoH / DoQ)</h2>
+        <p>Enable DNS-over-TLS and/or DNS-over-HTTPS and/or DNS-over-QUIC by giving them an address. If no
+          certificate is provided, a self-signed certificate for <code>localhost</code> is generated at
+          startup (for local testing only):</p>
+        <pre><code>./target/release/mini-dns \
+    --dot-addr 127.0.0.1:8853 \
+    --doh-addr 127.0.0.1:8443 \
+    --doq-addr 127.0.0.1:8853</code></pre>
+        <p>DoH exposes <code>/dns-query</code> (RFC&nbsp;8484) over HTTP/1.1 and HTTP/2, accepting
+          <code>POST</code> with an <code>application/dns-message</code> body or
+          <code>GET ?dns=&lt;base64url&gt;</code>. DoQ runs DNS over QUIC per RFC&nbsp;9250.</p>
+
+        <h3>How it works</h3>
+        <p>All three transports share the <em>same</em> DNS logic once decrypted:</p>
+        <ul>
+          <li><strong>DoT</strong>: TCP + a TLS handshake (rustls, ALPN <code>dot</code>) &rarr; a DNS
+            stream with a 2-byte length prefix per message &rarr; <code>handle_dns_stream</code>.</li>
+          <li><strong>DoH</strong>: TCP + TLS + HTTP (hyper auto-negotiates HTTP/1.1 or HTTP/2, ALPN
+            <code>h2</code> / <code>http/1.1</code>) &rarr; the <code>/dns-query</code> handler unwraps the
+            POST body or <code>?dns=</code> query param into a DNS message and calls
+            <code>state.resolve</code>. HTTP/2 keep-alive lets many queries be multiplexed over one
+            connection.</li>
+          <li><strong>DoQ</strong>: QUIC (quinn) with a rustls config advertising ALPN <code>doq</code>.
+            Each QUIC stream is one query, the handshake is 1 RTT, and the connection is migration-friendly
+            — faster than TCP+TLS.</li>
+        </ul>
+        <p><strong>Why not one shared listener?</strong> Because the transports use different protocols
+          (TCP vs QUIC on separate ports, HTTP on its own path), each needs its own bind. Sharing a single
+          port (e.g. 443 for DoH + DoQ) would require ALPN-based demux; we keep them separate for clarity
+          and easier debugging.</p>
+        <p><strong>Why generate a self-signed cert?</strong> So developers can test DoT/DoH/DoQ right away
+          (<code>kdig +tls -k</code>, <code>curl -k</code>) without mkcert/openssl. Production
+          <em>must</em> supply a real certificate via <code>--tls-cert</code> / <code>--tls-key</code> so
+          clients can trust it.</p>
+      </section>
+
+      <section id="ratelimit">
+        <h2>Rate limiting</h2>
+        <p>Limits the number of queries a client IP can send within a time window (default 1s). Enabled
+          via <code>--rate-limit N</code> or <code>[server].rate_limit = N</code>. <code>0</code> =
+          unlimited.</p>
+
+        <h3>How it works</h3>
+        <p>Fixed-window counter per IP in a <code>DashMap&lt;IpAddr, Window&gt;</code>. Each
+          <code>allow(ip)</code> insert-or-updates the entry: if <code>now - started_at &ge; window</code>
+          the counter resets to 1; otherwise <code>count++</code> and return <code>count &le; max</code>.
+          A 60-second background task calls <code>cleanup()</code>, which <code>retain</code>s only entries
+          whose window hasn't fully elapsed.</p>
+        <p><strong>Why fixed-window instead of token bucket?</strong> Simpler, O(1), and tiny state
+          (~12 bytes per IP), enough to stop floods and amplification. Token bucket is more precise but
+          needs an extra timestamp plus arithmetic per call. Fixed-window is "good enough" for DNS and
+          costs less memory when an attacker spoofs millions of distinct IPs.</p>
+        <p><strong>Why silent drops?</strong> Replying REFUSED/SERVFAIL still spends bandwidth going back
+          to the client (100 bytes &times; 10k qps = 1 MB/s of useless replies). Dropping without a reply
+          cuts the return path of an amplification attack entirely. Legitimate clients simply retry with
+          backoff.</p>
+      </section>
+
+      <section id="reload">
+        <h2>Hot reload &amp; graceful shutdown</h2>
+        <p>Send <code>SIGHUP</code> to reload the zone file (or all zones from the config file) in place,
+          without dropping in-flight queries or restarting:</p>
+        <pre><code>kill -HUP $(pgrep mini-dns)</code></pre>
+        <p>On <code>SIGTERM</code> or Ctrl+C the server drains in-flight queries before exiting. A
+          <code>/healthz</code> endpoint (on the metrics listener) is available for load balancers.</p>
+
+        <h3>How it works</h3>
+        <p><strong>SIGHUP reload</strong>: a background task waits on
+          <code>signal(SignalKind::hangup)</code> and calls <code>state.reload()</code>. The reload re-reads
+          the zone file / entire config (when the path ends in <code>.toml</code>), builds a new
+          <code>ZoneSet</code>, and publishes it via <code>ArcSwap::store</code>. In-flight queries keep an
+          <code>Arc</code> to the old snapshot, so they stay safe — the old <code>Arc</code> isn't freed
+          until the last reader finishes. The blocklist reloads the same way.</p>
+        <p><strong>SIGTERM shutdown</strong>: the signal handler sends <code>true</code> on a
+          <code>watch::channel</code> and sets an <code>AtomicBool shutting_down</code>. Every recv loop /
+          acceptor does a <code>select!</code> on this channel so it returns immediately when the signal
+          fires. <code>run</code> waits up to <code>SHUTDOWN_GRACE = 5s</code> for spawned tasks, then
+          returns, the runtime drops, and the process exits. <code>/healthz</code> returns <code>503</code>
+          once <code>shutting_down</code> is true, so load balancers stop sending new queries immediately.</p>
+        <p><strong>Why not clear the old zone then load?</strong> There'd be a window where the server
+          answers nothing. <code>ArcSwap</code> swaps atomically, so there's always one valid snapshot to
+          read until the swap completes — no downtime window.</p>
+        <p><strong>Why a 5s grace period?</strong> It covers ~99% of forwarded queries (the default
+          upstream timeout is 5s). Anything longer is dropped when the runtime shuts down — acceptable so
+          the process doesn't hang forever in CI/ deploys.</p>
       </section>
 
       <section id="metrics">
-        <h2>Metrics</h2>
-        <p>Pass <code>--metrics-addr</code> to expose Prometheus metrics over plain HTTP at <code>/metrics</code>:</p>
-        <pre><code>./target/release/mini-dns --metrics-addr 127.0.0.1:9090
-curl http://127.0.0.1:9090/metrics</code></pre>
+        <h2>Metrics &amp; health</h2>
+        <p>Pass <code>--metrics-addr</code> (or set <code>[metrics]</code> in the config) to expose
+          Prometheus metrics over plain HTTP at <code>/metrics</code>, plus a <code>/healthz</code> endpoint:</p>
+        <pre><code>./target/release/mini-dns --metrics-addr 127.0.0.1:9153
+curl http://127.0.0.1:9153/metrics
+curl http://127.0.0.1:9153/healthz</code></pre>
+        <p>In-process metrics are also logged periodically.</p>
+
+        <h3>How it works</h3>
+        <p>Counters and gauges are sharded per core (a <code>DashMap</code> or per-worker array with
+          cache-line padding), so <code>inc_*</code> calls never contend on a lock. When <code>/metrics</code>
+          is scraped, the shards are summed and rendered in Prometheus exposition format
+          (<code>text/plain; version=0.0.4</code>). <code>/healthz</code> just checks the
+          <code>AtomicBool shutting_down</code> flag and returns 200 (<code>ok</code>) or 503 (shutting
+          down).</p>
+        <p>The main exposed metrics:</p>
+        <ul>
+          <li><code>mini_dns_queries_total</code> &mdash; total queries received</li>
+          <li><code>mini_dns_authoritative_total</code> &mdash; answered from a local zone</li>
+          <li><code>mini_dns_forwarded_total</code> &mdash; forwarded / recursed</li>
+          <li><code>mini_dns_cache_hits_total</code> / <code>cache_misses_total</code></li>
+          <li><code>mini_dns_coalesced_total</code> &mdash; single-flight followers</li>
+          <li><code>mini_dns_blocked_total</code> &mdash; blocked by blocklist</li>
+          <li><code>mini_dns_rate_limited_total</code> &mdash; dropped by rate limiter</li>
+          <li><code>mini_dns_errors_total</code> &mdash; SERVFAIL / parse failures</li>
+        </ul>
+        <p><strong>Why shard metrics?</strong> With a single <code>AtomicU64</code>, each
+          <code>inc_total</code> on any core would be an atomic RMW on the same cache line — heavy
+          contention and cache-line ping-pong. Per-core sharding with cache-line padding avoids
+          false-sharing, so an increment is essentially uncontended.</p>
+        <p><strong>Why plain HTTP for <code>/metrics</code>?</strong> Prometheus scraping usually happens
+          over an internal network or pod localhost. TLS on the metrics endpoint adds operational
+          complexity (cert rotation) for little security benefit once a network policy is in place.</p>
       </section>
 
       <section id="query">
@@ -160,12 +896,13 @@ printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x
   | curl -sk --http2 -H 'content-type: application/dns-message' \
       --data-binary @- https://127.0.0.1:8443/dns-query | xxd</code></pre>
       </section>
+
     </main>
   </div>
 
   <footer>
     <div class="wrap">
-      <p>mini-dns — <a href="https://github.com/uy-td-dev/mini-dns">source on GitHub</a>.</p>
+      <p>mini-dns &mdash; <a href="https://github.com/uy-td-dev/mini-dns">source on GitHub</a>.</p>
     </div>
   </footer>
 </body>

@@ -1,4 +1,4 @@
-use mini_dns::config::Zone;
+use mini_dns::config::{Zone, ZoneSet};
 use mini_dns::dns::packet::DnsPacket;
 use mini_dns::dns::record::DnsRecord;
 use mini_dns::server;
@@ -23,7 +23,7 @@ const QUERY: &[u8] = &[
     0x00, 0x01, // QCLASS: IN
 ];
 
-fn example_zone() -> Zone {
+fn example_zone() -> ZoneSet {
     let mut zone = Zone::new();
     zone.insert(
         "example.com".to_string(),
@@ -33,7 +33,7 @@ fn example_zone() -> Zone {
             ttl: 3600,
         }],
     );
-    zone
+    ZoneSet::from_single("example.com".to_string(), zone)
 }
 
 #[tokio::test]
@@ -42,9 +42,12 @@ async fn test_server_integration() {
     let server_socket = server::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_socket.local_addr().unwrap();
 
+    // Shutdown signal that never fires (the test aborts the task instead).
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+
     // Run the server in a background task
     let server_handle = tokio::spawn(async move {
-        server::serve(ServerState::authoritative(example_zone()), server_socket)
+        server::serve(ServerState::authoritative(example_zone()), server_socket, rx)
             .await
             .unwrap();
     });
@@ -82,8 +85,9 @@ async fn test_server_tcp() {
     // Bind a TCP listener on a free port and serve it.
     let listener = server::bind_tcp("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
+    let (_tx, rx) = tokio::sync::watch::channel(false);
     let server_handle = tokio::spawn(async move {
-        server::serve_tcp(ServerState::authoritative(example_zone()), listener)
+        server::serve_tcp(ServerState::authoritative(example_zone()), listener, rx)
             .await
             .unwrap();
     });

@@ -1,10 +1,10 @@
 use mini_dns::cache::Cache;
-use mini_dns::config::Zone;
+use mini_dns::config::{ForwardRules, ZoneSet};
 use mini_dns::dns::header::DnsHeader;
 use mini_dns::dns::packet::DnsPacket;
 use mini_dns::dns::question::DnsQuestion;
 use mini_dns::dns::record::DnsRecord;
-use mini_dns::forwarder::Forwarder;
+use mini_dns::forwarder::MultiForwarder;
 use mini_dns::ratelimit::RateLimiter;
 use mini_dns::state::{ServerState, Transport};
 use std::net::{IpAddr, Ipv4Addr};
@@ -49,6 +49,19 @@ async fn spawn_fake_upstream() -> std::net::SocketAddr {
     addr
 }
 
+/// Builds a `ServerState` with an empty zone, forwarding everything to
+/// `upstream` (2s timeout) and the given rate limiter.
+fn forward_state(upstream: std::net::SocketAddr, limiter: RateLimiter) -> ServerState {
+    ServerState::new(
+        ZoneSet::empty(),
+        None,
+        ForwardRules::single(upstream),
+        Some(MultiForwarder::new(Duration::from_secs(2))),
+        Cache::new(16),
+        limiter,
+    )
+}
+
 fn query_bytes(name: &str) -> Vec<u8> {
     query_bytes_id(name, 0x1111)
 }
@@ -78,13 +91,7 @@ fn query_bytes_id(name: &str, id: u16) -> Vec<u8> {
 #[tokio::test]
 async fn forwards_unknown_names_and_caches() {
     let upstream = spawn_fake_upstream().await;
-    let state = ServerState::new(
-        Zone::new(), // empty zone -> everything is forwarded
-        None,
-        Some(Forwarder::new(upstream, Duration::from_secs(2))),
-        Cache::new(16),
-        RateLimiter::disabled(),
-    );
+    let state = forward_state(upstream, RateLimiter::disabled());
     let client = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     let query = query_bytes("notlocal.example");
 
@@ -116,13 +123,7 @@ async fn forwards_unknown_names_and_caches() {
 #[tokio::test]
 async fn rate_limiter_drops_excess_queries() {
     let upstream = spawn_fake_upstream().await;
-    let state = ServerState::new(
-        Zone::new(),
-        None,
-        Some(Forwarder::new(upstream, Duration::from_secs(2))),
-        Cache::new(16),
-        RateLimiter::new(2, Duration::from_secs(60)),
-    );
+    let state = forward_state(upstream, RateLimiter::new(2, Duration::from_secs(60)));
     let client = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
     let query = query_bytes("a.example");
 
@@ -179,13 +180,7 @@ async fn spawn_nxdomain_upstream() -> (std::net::SocketAddr, Arc<AtomicU64>) {
 #[tokio::test]
 async fn negative_results_are_cached() {
     let (upstream, counter) = spawn_nxdomain_upstream().await;
-    let state = ServerState::new(
-        Zone::new(),
-        None,
-        Some(Forwarder::new(upstream, Duration::from_secs(2))),
-        Cache::new(16),
-        RateLimiter::disabled(),
-    );
+    let state = forward_state(upstream, RateLimiter::disabled());
     let client = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     let query = query_bytes("ghost.example");
 
@@ -251,13 +246,7 @@ async fn spawn_counting_slow_upstream() -> (std::net::SocketAddr, Arc<AtomicU64>
 #[tokio::test]
 async fn single_flight_coalesces_concurrent_misses() {
     let (upstream, counter) = spawn_counting_slow_upstream().await;
-    let state = Arc::new(ServerState::new(
-        Zone::new(),
-        None,
-        Some(Forwarder::new(upstream, Duration::from_secs(2))),
-        Cache::new(16),
-        RateLimiter::disabled(),
-    ));
+    let state = Arc::new(forward_state(upstream, RateLimiter::disabled()));
     let client = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
     // Fire many concurrent queries for the SAME name, each with a distinct ID.
@@ -289,4 +278,96 @@ async fn single_flight_coalesces_concurrent_misses() {
         "expected coalescing, upstream got {upstream_hits} of {n}"
     );
     assert!(state.metrics.coalesced() >= 1);
+}
+
+/// Upstream that returns 40 A records for any query, producing a response well
+/// over the 512-byte classic UDP limit but under the EDNS 1232-byte limit.
+async fn spawn_large_response_upstream() -> std::net::SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1232];
+        loop {
+            let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let request = DnsPacket::from_bytes(&buf[..len]).unwrap();
+            let question = request.questions[0].clone();
+            let answers: Vec<DnsRecord> = (0..40u8)
+                .map(|i| DnsRecord::A {
+                    domain: question.qname.clone(),
+                    addr: Ipv4Addr::new(203, 0, 113, i),
+                    ttl: 300,
+                })
+                .collect();
+            let response = DnsPacket {
+                header: DnsHeader {
+                    id: request.header.id,
+                    flags: 0x8180,
+                    questions: 1,
+                    answers: answers.len() as u16,
+                    authorities: 0,
+                    additionals: 0,
+                },
+                questions: vec![question],
+                answers,
+                authorities: vec![],
+                additionals: vec![],
+            };
+            socket.send_to(&response.to_bytes(), peer).await.unwrap();
+        }
+    });
+    addr
+}
+
+/// Builds a query with an EDNS OPT record advertising `udp_size`.
+fn query_bytes_edns(name: &str, id: u16, udp_size: u16) -> Vec<u8> {
+    DnsPacket {
+        header: DnsHeader {
+            id,
+            flags: 0x0100,
+            questions: 1,
+            answers: 0,
+            authorities: 0,
+            additionals: 1,
+        },
+        questions: vec![DnsQuestion {
+            qname: name.to_string(),
+            qtype: 1,
+            qclass: 1,
+        }],
+        answers: vec![],
+        authorities: vec![],
+        additionals: vec![DnsRecord::OPT { udp_size }],
+    }
+    .to_bytes()
+}
+
+/// A cache hit must re-encode the response for the *current* client's EDNS size,
+/// not the original querier's. A large response cached for an EDNS client must
+/// be truncated (TC bit set) when served to a non-EDNS client over UDP.
+#[tokio::test]
+async fn cache_hit_truncates_for_smaller_edns_client() {
+    let upstream = spawn_large_response_upstream().await;
+    let state = forward_state(upstream, RateLimiter::disabled());
+    let client = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+    // Client A: EDNS 1232 — gets the full 40-answer response, which is cached.
+    let query_big = query_bytes_edns("large.example", 0xAAAA, 1232);
+    let resp_big = state
+        .resolve(&query_big, client, Transport::Udp)
+        .await
+        .expect("response");
+    let packet_big = DnsPacket::from_bytes(&resp_big).unwrap();
+    assert_eq!(packet_big.answers.len(), 40);
+    assert_eq!(packet_big.header.flags & 0x0200, 0); // no TC bit
+
+    // Client B: no EDNS — cache hit, response must be truncated to fit 512.
+    let query_small = query_bytes_id("large.example", 0xBBBB);
+    let resp_small = state
+        .resolve(&query_small, client, Transport::Udp)
+        .await
+        .expect("response");
+    let packet_small = DnsPacket::from_bytes(&resp_small).unwrap();
+    assert_eq!(packet_small.answers.len(), 0); // answers dropped by truncation
+    assert_ne!(packet_small.header.flags & 0x0200, 0); // TC bit set
+    assert_eq!(state.metrics.cache_hits(), 1);
 }

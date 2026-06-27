@@ -4,8 +4,12 @@
 //! fresh socket per query) and a semaphore to bound how many upstream queries
 //! run concurrently. Responses are matched to their query by transaction ID so
 //! a stale datagram on a reused socket is never mistaken for the answer.
+//!
+//! [`MultiForwarder`] manages one [`Forwarder`] per upstream address so that
+//! conditional forwarding rules can target different resolvers.
 
 use anyhow::{anyhow, Context, Result};
+use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -92,6 +96,7 @@ impl Forwarder {
     }
 
     /// Sends one query on a connected socket and reads the matching response.
+    /// If the response is truncated (TC bit set), retries over TCP.
     async fn query_once(&self, socket: &UdpSocket, query: &[u8]) -> Result<Vec<u8>> {
         socket
             .send(query)
@@ -99,7 +104,7 @@ impl Forwarder {
             .context("failed to send to upstream")?;
         let want = [query[0], query[1]];
 
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; 65535];
         for _ in 0..MAX_STALE {
             let len = timeout(self.timeout, socket.recv(&mut buf))
                 .await
@@ -108,9 +113,90 @@ impl Forwarder {
             // Match the transaction ID; ignore stale datagrams from a prior query.
             if len >= 2 && buf[0] == want[0] && buf[1] == want[1] {
                 buf.truncate(len);
+                // Check TC (truncation) bit — if set, retry over TCP.
+                if len >= 4 && (buf[2] & 0x02) != 0 {
+                    return self.query_tcp(query).await;
+                }
                 return Ok(buf);
             }
         }
         Err(anyhow!("no matching upstream response (transaction ID mismatch)"))
+    }
+
+    /// Sends a query over TCP (2-byte length framing) and returns the response.
+    /// Used as a fallback when a UDP response is truncated (TC bit set).
+    async fn query_tcp(&self, query: &[u8]) -> Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let mut stream = timeout(self.timeout, TcpStream::connect(self.upstream))
+            .await
+            .context("TCP connect to upstream timed out")?
+            .context("failed to connect to upstream over TCP")?;
+
+        // Send 2-byte length prefix + query.
+        let len = (query.len() as u16).to_be_bytes();
+        timeout(self.timeout, stream.write_all(&len))
+            .await
+            .context("TCP write length timed out")?
+            .context("failed to write length to upstream over TCP")?;
+        timeout(self.timeout, stream.write_all(query))
+            .await
+            .context("TCP write query timed out")?
+            .context("failed to write query to upstream over TCP")?;
+
+        // Read 2-byte length prefix + response.
+        let mut len_buf = [0u8; 2];
+        timeout(self.timeout, stream.read_exact(&mut len_buf))
+            .await
+            .context("TCP read length timed out")?
+            .context("failed to read length from upstream over TCP")?;
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; resp_len];
+        timeout(self.timeout, stream.read_exact(&mut resp))
+            .await
+            .context("TCP read response timed out")?
+            .context("failed to read response from upstream over TCP")?;
+        Ok(resp)
+    }
+}
+
+/// Manages a [`Forwarder`] per upstream address, so conditional forwarding
+/// rules (each pointing at a different resolver) can share one concurrency
+/// budget while keeping per-upstream socket pools isolated.
+///
+/// A `Forwarder` is created lazily the first time an upstream is queried and
+/// reused for subsequent queries to the same upstream.
+pub struct MultiForwarder {
+    forwarders: DashMap<SocketAddr, Arc<Forwarder>>,
+    timeout: Duration,
+}
+
+impl MultiForwarder {
+    /// Creates a multi-forwarder with the given per-query timeout.
+    pub fn new(timeout: Duration) -> Self {
+        MultiForwarder {
+            forwarders: DashMap::new(),
+            timeout,
+        }
+    }
+
+    /// Returns the [`Forwarder`] for `upstream`, creating one on first use.
+    fn get_or_create(&self, upstream: SocketAddr) -> Arc<Forwarder> {
+        self.forwarders
+            .entry(upstream)
+            .or_insert_with(|| Arc::new(Forwarder::new(upstream, self.timeout)))
+            .clone()
+    }
+
+    /// Forwards `query` to `upstream` and returns the response bytes.
+    pub async fn forward(&self, query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
+        let forwarder = self.get_or_create(upstream);
+        forwarder.forward(query).await
+    }
+
+    /// The upstream resolvers currently active (for logging/diagnostics).
+    pub fn active_upstreams(&self) -> Vec<SocketAddr> {
+        self.forwarders.iter().map(|e| *e.key()).collect()
     }
 }

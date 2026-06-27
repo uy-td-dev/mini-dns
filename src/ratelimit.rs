@@ -47,7 +47,7 @@ impl RateLimiter {
             count: 0,
         });
 
-        if now.duration_since(window.started_at) >= self.window {
+        if now.checked_duration_since(window.started_at).is_some_and(|d| d >= self.window) {
             window.started_at = now;
             window.count = 0;
         }

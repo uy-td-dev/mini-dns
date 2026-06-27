@@ -169,6 +169,78 @@ impl DnsPacketEncoder {
                 self.buf.extend_from_slice(&0u32.to_be_bytes());
                 self.buf.extend_from_slice(&0u16.to_be_bytes());
             }
+            DnsRecord::DNSKEY {
+                domain,
+                flags,
+                protocol,
+                algorithm,
+                public_key,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_DNSKEY, *ttl);
+                self.encode_rdata(|enc| {
+                    enc.buf.extend_from_slice(&flags.to_be_bytes());
+                    enc.buf.push(*protocol);
+                    enc.buf.push(*algorithm);
+                    enc.buf.extend_from_slice(public_key);
+                });
+            }
+            DnsRecord::RRSIG {
+                domain,
+                type_covered,
+                algorithm,
+                labels,
+                original_ttl,
+                signature_expiration,
+                signature_inception,
+                key_tag,
+                signer_name,
+                signature,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_RRSIG, *ttl);
+                self.encode_rdata(|enc| {
+                    enc.buf.extend_from_slice(&type_covered.to_be_bytes());
+                    enc.buf.push(*algorithm);
+                    enc.buf.push(*labels);
+                    enc.buf.extend_from_slice(&original_ttl.to_be_bytes());
+                    enc.buf.extend_from_slice(&signature_expiration.to_be_bytes());
+                    enc.buf.extend_from_slice(&signature_inception.to_be_bytes());
+                    enc.buf.extend_from_slice(&key_tag.to_be_bytes());
+                    // RRSIG signer name is not compressed (RFC 4034 §3.2).
+                    enc.encode_name_uncompressed(signer_name);
+                    enc.buf.extend_from_slice(signature);
+                });
+            }
+            DnsRecord::DS {
+                domain,
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_DS, *ttl);
+                self.encode_rdata(|enc| {
+                    enc.buf.extend_from_slice(&key_tag.to_be_bytes());
+                    enc.buf.push(*algorithm);
+                    enc.buf.push(*digest_type);
+                    enc.buf.extend_from_slice(digest);
+                });
+            }
+            DnsRecord::NSEC {
+                domain,
+                next_name,
+                type_bitmap,
+                ttl,
+            } => {
+                self.encode_record_header(domain, DnsRecord::TYPE_NSEC, *ttl);
+                self.encode_rdata(|enc| {
+                    // NSEC next name is not compressed (RFC 4034 §4.1.2).
+                    enc.encode_name_uncompressed(next_name);
+                    enc.buf.extend_from_slice(type_bitmap);
+                });
+            }
         }
     }
 

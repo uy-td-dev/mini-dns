@@ -1,4 +1,3 @@
-use crate::config::Zone;
 use crate::dns::encoder::DnsPacketEncoder;
 use crate::dns::header::DnsHeader;
 use crate::dns::question::DnsQuestion;
@@ -265,6 +264,98 @@ impl DnsPacket {
                 })
             }
             DnsRecord::TYPE_OPT => Some(DnsRecord::OPT { udp_size: class }),
+            DnsRecord::TYPE_DNSKEY => {
+                if data_len < 4 {
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_DNSKEY,
+                    });
+                }
+                let flags = u16::from_be_bytes([buf[record_data_start], buf[record_data_start + 1]]);
+                let protocol = buf[record_data_start + 2];
+                let algorithm = buf[record_data_start + 3];
+                let public_key = buf[record_data_start + 4..record_data_start + data_len].to_vec();
+                Some(DnsRecord::DNSKEY {
+                    domain,
+                    flags,
+                    protocol,
+                    algorithm,
+                    public_key,
+                    ttl,
+                })
+            }
+            DnsRecord::TYPE_RRSIG => {
+                if data_len < 18 {
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_RRSIG,
+                    });
+                }
+                let type_covered = u16::from_be_bytes([buf[record_data_start], buf[record_data_start + 1]]);
+                let algorithm = buf[record_data_start + 2];
+                let labels = buf[record_data_start + 3];
+                let original_ttl = u32::from_be_bytes([
+                    buf[record_data_start + 4],
+                    buf[record_data_start + 5],
+                    buf[record_data_start + 6],
+                    buf[record_data_start + 7],
+                ]);
+                let signature_expiration = u32::from_be_bytes([
+                    buf[record_data_start + 8],
+                    buf[record_data_start + 9],
+                    buf[record_data_start + 10],
+                    buf[record_data_start + 11],
+                ]);
+                let signature_inception = u32::from_be_bytes([
+                    buf[record_data_start + 12],
+                    buf[record_data_start + 13],
+                    buf[record_data_start + 14],
+                    buf[record_data_start + 15],
+                ]);
+                let key_tag = u16::from_be_bytes([buf[record_data_start + 16], buf[record_data_start + 17]]);
+                let (signer_name, after_signer) = Self::parse_qname(buf, record_data_start + 18)?;
+                let signature = buf[after_signer..record_data_start + data_len].to_vec();
+                Some(DnsRecord::RRSIG {
+                    domain,
+                    type_covered,
+                    algorithm,
+                    labels,
+                    original_ttl,
+                    signature_expiration,
+                    signature_inception,
+                    key_tag,
+                    signer_name,
+                    signature,
+                    ttl,
+                })
+            }
+            DnsRecord::TYPE_DS => {
+                if data_len < 4 {
+                    return Err(DnsError::InvalidRdata {
+                        rtype: DnsRecord::TYPE_DS,
+                    });
+                }
+                let key_tag = u16::from_be_bytes([buf[record_data_start], buf[record_data_start + 1]]);
+                let algorithm = buf[record_data_start + 2];
+                let digest_type = buf[record_data_start + 3];
+                let digest = buf[record_data_start + 4..record_data_start + data_len].to_vec();
+                Some(DnsRecord::DS {
+                    domain,
+                    key_tag,
+                    algorithm,
+                    digest_type,
+                    digest,
+                    ttl,
+                })
+            }
+            DnsRecord::TYPE_NSEC => {
+                let (next_name, after_name) = Self::parse_qname(buf, record_data_start)?;
+                let type_bitmap = buf[after_name..record_data_start + data_len].to_vec();
+                Some(DnsRecord::NSEC {
+                    domain,
+                    next_name,
+                    type_bitmap,
+                    ttl,
+                })
+            }
             _ => None, // unmodelled type: skip, advancing past its rdata
         };
 
@@ -401,13 +492,13 @@ impl DnsPacket {
         truncated.to_bytes()
     }
 
-    /// Builds a response packet for the current query against `zone`.
+    /// Builds a response packet for the current query against `zones`.
     ///
     /// Delegates to [`super::resolver::build_response`]; the resolution logic
     /// (wildcards, CNAME chasing, AA/NXDOMAIN/NODATA) lives there, separate from
     /// this module's wire (de)serialisation concerns.
-    pub fn build_response(&self, zone: &Zone) -> DnsPacket {
-        crate::dns::resolver::build_response(self, zone)
+    pub fn build_response(&self, zones: &crate::config::ZoneSet) -> DnsPacket {
+        crate::dns::resolver::build_response(self, zones)
     }
 }
 

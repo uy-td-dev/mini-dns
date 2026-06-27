@@ -1,5 +1,5 @@
 use base64::Engine;
-use mini_dns::config::Zone;
+use mini_dns::config::{Zone, ZoneSet};
 use mini_dns::dns::header::DnsHeader;
 use mini_dns::dns::packet::DnsPacket;
 use mini_dns::dns::question::DnsQuestion;
@@ -19,7 +19,7 @@ use tokio_rustls::TlsConnector;
 
 const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
-fn example_zone() -> Zone {
+fn example_zone() -> ZoneSet {
     let mut zone = Zone::new();
     zone.insert(
         "example.com".to_string(),
@@ -29,7 +29,7 @@ fn example_zone() -> Zone {
             ttl: 3600,
         }],
     );
-    zone
+    ZoneSet::from_single("example.com".to_string(), zone)
 }
 
 fn query_bytes(name: &str) -> Vec<u8> {
@@ -110,10 +110,12 @@ async fn dot_integration() {
 
     let listener = server::bind_tcp("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (_tx, rx) = tokio::sync::watch::channel(false);
     let server_handle = tokio::spawn(server::serve_dot(
         ServerState::authoritative(example_zone()),
         listener,
         acceptor,
+        rx,
     ));
 
     // Build a client that trusts the generated certificate.

@@ -21,6 +21,7 @@ struct Counters {
     forwarded: AtomicU64,
     coalesced: AtomicU64,
     rate_limited: AtomicU64,
+    blocked: AtomicU64,
     errors: AtomicU64,
 }
 
@@ -91,6 +92,9 @@ impl Metrics {
     pub fn inc_rate_limited(&self) {
         self.bump(|c| &c.rate_limited);
     }
+    pub fn inc_blocked(&self) {
+        self.bump(|c| &c.blocked);
+    }
     pub fn inc_error(&self) {
         self.bump(|c| &c.errors);
     }
@@ -112,6 +116,9 @@ impl Metrics {
     }
     pub fn rate_limited(&self) -> u64 {
         self.sum(|c| &c.rate_limited)
+    }
+    pub fn blocked(&self) -> u64 {
+        self.sum(|c| &c.blocked)
     }
     pub fn errors(&self) -> u64 {
         self.sum(|c| &c.errors)
@@ -148,6 +155,11 @@ impl Metrics {
                 self.rate_limited(),
             ),
             (
+                "mini_dns_blocked_total",
+                "Queries blocked by the blocklist",
+                self.blocked(),
+            ),
+            (
                 "mini_dns_errors_total",
                 "Packets that failed to parse or forward",
                 self.errors(),
@@ -164,13 +176,14 @@ impl Metrics {
     /// Returns a human-readable one-line snapshot of the current counters.
     pub fn summary(&self) -> String {
         format!(
-            "total={} authoritative={} cache_hits={} forwarded={} coalesced={} rate_limited={} errors={}",
+            "total={} authoritative={} cache_hits={} forwarded={} coalesced={} rate_limited={} blocked={} errors={}",
             self.total(),
             self.authoritative(),
             self.cache_hits(),
             self.forwarded(),
             self.coalesced(),
             self.rate_limited(),
+            self.blocked(),
             self.errors(),
         )
     }
